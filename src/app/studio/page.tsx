@@ -15,6 +15,7 @@ import {
   toFileList,
 } from "@/lib/storage";
 import type { ProjectFiles, StoredProject } from "@/lib/storage";
+import type { ProjectFile, ProjectManifest } from "@/lib/project";
 
 /*
  * Studio page — AI website builder at /studio.
@@ -101,6 +102,10 @@ export default function StudioPage() {
   const [project, setProject] = useState<StoredProject>(SERVER_PROJECT);
   const [drafts, setDrafts] = useState<ProjectFiles>(INITIAL_FILES);
   const [applied, setApplied] = useState<ProjectFiles>(INITIAL_FILES);
+  const [projectFiles, setProjectFiles] = useState<ProjectFile[]>([]);
+  const [projectManifest, setProjectManifest] = useState<ProjectManifest | null>(
+    null,
+  );
   const [conversation, setConversation] = useState<StoredProject["conversation"]>(
     [],
   );
@@ -133,6 +138,10 @@ export default function StudioPage() {
         // Projects saved before drafts were split have one copy: treat it as
         // already applied, matching the live preview they were saved under.
         setApplied(fromFileList(stored.applied ?? stored.files) ?? INITIAL_FILES);
+        // M3.1: restore the generated multi-file source when present. Legacy
+        // projects have no source and simply keep their old behaviour.
+        setProjectFiles(stored.source ?? []);
+        setProjectManifest(stored.manifest ?? null);
         setConversation(stored.conversation);
       } else {
         setProject(createEmptyProject());
@@ -146,7 +155,8 @@ export default function StudioPage() {
   /*
    * Persist the project on every change. Both copies of the code are written,
    * so a refresh restores the drafts *and* the applied version — the preview
-   * does not silently advance to unsaved edits.
+   * does not silently advance to unsaved edits. The generated multi-file
+   * source is stored alongside when present.
    */
   useEffect(() => {
     if (!hydrated) return;
@@ -154,9 +164,11 @@ export default function StudioPage() {
       ...project,
       files: toFileList(drafts),
       applied: toFileList(applied),
+      ...(projectFiles.length > 0 ? { source: projectFiles } : {}),
+      ...(projectManifest ? { manifest: projectManifest } : {}),
       conversation,
     });
-  }, [hydrated, project, drafts, applied, conversation]);
+  }, [hydrated, project, drafts, applied, projectFiles, projectManifest, conversation]);
 
   const handleGenerate = useCallback(
     async (prompt: string) => {
@@ -188,15 +200,24 @@ export default function StudioPage() {
           throw new Error(data.error || "Generation failed.");
         }
 
-        // Generated code replaces both copies: it is what the user asked for,
-        // so it belongs in the preview straight away with nothing to apply.
-        const generated: ProjectFiles = {
-          html: data.html,
-          css: data.css,
-          javascript: data.javascript,
-        };
-        setDrafts(generated);
-        setApplied(generated);
+        // Store compiled output in drafts/applied (backward compatible with
+        // existing preview and code panel). The multi-file source is stored
+        // separately for future file-tree editor support.
+        const compiled = data.compiled;
+        if (compiled) {
+          setDrafts({
+            html: compiled.html,
+            css: compiled.css,
+            javascript: compiled.javascript,
+          });
+          setApplied({
+            html: compiled.html,
+            css: compiled.css,
+            javascript: compiled.javascript,
+          });
+        }
+        setProjectFiles(data.files ?? []);
+        setProjectManifest(data.manifest ?? null);
         setConversation((prev) => [
           ...prev,
           {
@@ -254,6 +275,8 @@ export default function StudioPage() {
     }
     setDrafts(INITIAL_FILES);
     setApplied(INITIAL_FILES);
+    setProjectFiles([]);
+    setProjectManifest(null);
     setConversation([]);
     setError(null);
     clearProject();

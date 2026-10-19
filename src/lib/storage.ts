@@ -18,6 +18,19 @@
 
 const STORAGE_KEY = "gsap_studio_project_v1";
 
+/*
+ * The M3.1 source tree and manifest live in their own module; the storage
+ * schema only stores them. `ProjectFile` here is the legacy name/content
+ * pair — the M3.1 file type is imported under an alias to keep the two
+ * apart.
+ */
+import type {
+  ProjectFile as SourceProjectFile,
+  ProjectManifest,
+} from "@/lib/project";
+
+export type { ProjectManifest } from "@/lib/project";
+
 export interface ProjectFile {
   name: string;
   content: string;
@@ -43,6 +56,15 @@ export interface StoredProject {
   /** The version rendered in the preview. Absent in pre-Milestone-2 data. */
   applied?: ProjectFile[];
   conversation: ConversationMessage[];
+  /**
+   * Milestone 3.1: the multi-file React + TypeScript source the AI generated.
+   * Optional and additive — projects saved before M3.1 (and legacy
+   * HTML/CSS/JavaScript projects) simply do not have it and keep loading
+   * exactly as before.
+   */
+  source?: SourceProjectFile[];
+  /** Manifest describing the generated project. Absent in pre-M3.1 data. */
+  manifest?: ProjectManifest;
 }
 
 const FILE_ROUTES: ReadonlyArray<{ name: string; key: keyof ProjectFiles }> = [
@@ -99,6 +121,47 @@ function normalizeFileList(input: unknown): ProjectFile[] {
   return FILE_ROUTES.map(({ name }) => ({ name, content: byName.get(name) ?? "" }));
 }
 
+/**
+ * Normalize the M3.1 multi-file source list. Entries without a string
+ * path/content are dropped; a malformed list yields undefined so the
+ * project falls back to its legacy HTML/CSS/JavaScript behaviour.
+ */
+function normalizeSourceList(input: unknown): SourceProjectFile[] | undefined {
+  if (!Array.isArray(input)) return undefined;
+  const out: SourceProjectFile[] = [];
+  for (const entry of input) {
+    if (!entry || typeof entry !== "object") continue;
+    const { path, content } = entry as { path?: unknown; content?: unknown };
+    if (typeof path !== "string" || typeof content !== "string") continue;
+    out.push({ path, content });
+  }
+  return out.length > 0 ? out : undefined;
+}
+
+/** Normalize the M3.1 manifest. Anything malformed yields undefined. */
+function normalizeManifest(input: unknown): ProjectManifest | undefined {
+  if (!input || typeof input !== "object" || Array.isArray(input)) return undefined;
+  const m = input as Record<string, unknown>;
+  if (typeof m.name !== "string" || typeof m.version !== "string") return undefined;
+  if (typeof m.entry !== "string") return undefined;
+  if (m.framework !== "react-ts") return undefined;
+  if (!m.dependencies || typeof m.dependencies !== "object" || Array.isArray(m.dependencies)) {
+    return undefined;
+  }
+  const dependencies: Record<string, string> = {};
+  for (const [key, value] of Object.entries(m.dependencies)) {
+    if (typeof value !== "string") return undefined;
+    dependencies[key] = value;
+  }
+  return {
+    name: m.name,
+    version: m.version,
+    entry: m.entry,
+    dependencies,
+    framework: "react-ts",
+  };
+}
+
 function normalizeConversation(input: unknown): ConversationMessage[] {
   if (!Array.isArray(input)) return [];
   const out: ConversationMessage[] = [];
@@ -122,6 +185,10 @@ function normalizeProject(value: unknown): StoredProject | null {
     ? normalizeFileList(record.applied)
     : undefined;
 
+  // M3.1 additions — both optional, both absent in pre-M3.1 projects.
+  const source = normalizeSourceList(record.source);
+  const manifest = normalizeManifest(record.manifest);
+
   return {
     id:
       typeof record.id === "string" && record.id.length > 0
@@ -133,6 +200,8 @@ function normalizeProject(value: unknown): StoredProject | null {
         : Date.now(),
     files: normalizeFileList(record.files),
     ...(applied ? { applied } : {}),
+    ...(source ? { source } : {}),
+    ...(manifest ? { manifest } : {}),
     conversation: normalizeConversation(record.conversation),
   };
 }
@@ -171,10 +240,14 @@ export function loadProject(): StoredProject | null {
 export function saveProject(project: StoredProject): void {
   if (typeof window === "undefined") return;
   try {
+    const source = normalizeSourceList(project.source);
+    const manifest = normalizeManifest(project.manifest);
     const toSave: StoredProject = {
       ...project,
       files: normalizeFileList(project.files),
       ...(project.applied ? { applied: normalizeFileList(project.applied) } : {}),
+      ...(source ? { source } : {}),
+      ...(manifest ? { manifest } : {}),
       conversation: normalizeConversation(project.conversation),
       updatedAt: Date.now(),
     };

@@ -17,6 +17,9 @@
 /.next/
 /out/
 
+# generated browser runtime for the studio preview (rebuilt by npm run build:vendor)
+/public/vendor/
+
 # production
 /build
 

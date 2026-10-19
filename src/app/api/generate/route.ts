@@ -2,11 +2,12 @@
  * Server-side AI generation route.
  *
  * Accepts a conversation + current code, calls OpenRouter, validates
- * the structured result, and returns it to the client. Credentials are
- * never exposed to the browser.
+ * the structured result, compiles it, and returns it to the client.
+ * Credentials are never exposed to the browser.
  */
 
-import { generateWebsite } from "@/lib/ai";
+import { generateReactProject, REACT_SYSTEM_PROMPT, type ProjectResult } from "@/lib/ai";
+import { compileProject, type CompileInput } from "@/lib/compiler";
 import { NextRequest, NextResponse } from "next/server";
 
 interface GenerateRequest {
@@ -17,26 +18,36 @@ interface GenerateRequest {
   currentJs?: string;
 }
 
-const SYSTEM_PROMPT = `You are an expert front-end engineer and creative technologist. You build complete, single-file websites from natural language descriptions.
+interface CompiledOutput {
+  /**
+   * The complete preview document: import map, inlined CSS and the compiled
+   * module script. It is self-contained so the preview can render it without
+   * re-assembling anything.
+   */
+  html: string;
+  /** The raw CSS and JS bundles, kept for diagnostics and future tooling. */
+  css: string;
+  javascript: string;
+}
 
-Your output must be a valid JSON object with exactly three keys: "html", "css", and "javascript". No markdown fences, no explanation text outside the JSON.
-
-Design principles:
-- Premium, minimal, cinematic aesthetic. Near-black backgrounds, warm-white typography, muted grey details, restrained accent color.
-- Use semantic HTML5. Every image needs alt text. Use proper heading hierarchy.
-- Fully responsive: mobile-first, fluid typography with clamp(), touch-friendly targets.
-- Accessibility: sufficient color contrast, focus states, ARIA where appropriate, prefers-reduced-motion respected.
-- Include GSAP (from a CDN) where motion adds value — subtle reveals, scroll-triggered animations, smooth hover transitions. Keep it restrained and intentional.
-- CSS should be in a <style> block inside the HTML, JS in a <script> block, or as separate strings — the platform will assemble them.
-- No external images, no external fonts beyond Google Fonts if needed, no external APIs.
-- The HTML must be a complete document (<!DOCTYPE html><html><head><body>).
-- Keep code clean, well-commented, and production-quality.
-
-If this is a follow-up request, modify the existing code rather than starting from scratch unless the user explicitly asks for a new direction.`;
+interface GenerateResponse {
+  ok: boolean;
+  model?: string;
+  manifest?: ProjectResult["manifest"];
+  files?: ProjectResult["files"];
+  compiled?: CompiledOutput;
+  error?: string;
+  type?: string;
+  status?: number;
+}
 
 /**
  * POST /api/generate
  * Body: { model?, messages[], currentHtml?, currentCss?, currentJs? }
+ *
+ * Generates a multi-file React + TypeScript project, compiles it, and
+ * returns both the raw project files and the compiled output ready for
+ * the preview iframe.
  */
 export async function POST(req: NextRequest): Promise<NextResponse> {
   const modelFromEnv = process.env.OPENROUTER_MODEL;
@@ -63,7 +74,7 @@ export async function POST(req: NextRequest): Promise<NextResponse> {
   // Build the message list: system prompt first, then conversation, with
   // current code injected as context on follow-ups.
   const messages: Array<{ role: string; content: string }> = [
-    { role: "system", content: SYSTEM_PROMPT },
+    { role: "system", content: REACT_SYSTEM_PROMPT },
   ];
 
   // If we have existing code, inject it as context so the model modifies
@@ -75,21 +86,56 @@ export async function POST(req: NextRequest): Promise<NextResponse> {
   ) {
     messages.push({
       role: "system",
-      content: `CURRENT PROJECT STATE:\n--- HTML ---\n${body.currentHtml || "(empty)"}\n--- CSS ---\n${body.currentCss || "(empty)"}\n--- JAVASCRIPT ---\n${body.currentJs || "(empty)"}\n--- END ---\nModify this code to fulfill the user's request. Preserve what is working and only change what is needed.`,
+      content: `CURRENT PROJECT STATE (compiled output):\n--- HTML ---\n${body.currentHtml || "(empty)"}\n--- CSS ---\n${body.currentCss || "(empty)"}\n--- JAVASCRIPT ---\n${body.currentJs || "(empty)"}\n--- END ---\nModify this code to fulfill the user's request. Preserve what is working and only change what is needed.`,
     });
   }
 
   messages.push(...body.messages);
 
   try {
-    const result = await generateWebsite(messages as never, model);
+    const project = await generateReactProject(messages as never, model);
 
-    return NextResponse.json({
+    // Compile the generated project using the existing compiler pipeline.
+    const filesRecord: Record<string, string> = {};
+    for (const file of project.files) {
+      filesRecord[file.path] = file.content;
+    }
+
+    const compileInput: CompileInput = {
+      files: filesRecord,
+      entry: project.manifest.entry,
+    };
+
+    const compiled = await compileProject(compileInput);
+
+    if (compiled.diagnostics.length > 0) {
+      return NextResponse.json(
+        {
+          ok: false,
+          error: `Compilation failed: ${compiled.diagnostics.join("\n")}`,
+          type: "compilation_error",
+          status: 400,
+        },
+        { status: 400 },
+      );
+    }
+
+    return NextResponse.json<GenerateResponse>({
       ok: true,
       model,
-      html: result.html,
-      css: result.css,
-      javascript: result.javascript,
+      manifest: project.manifest,
+      files: project.files,
+      compiled: {
+        /*
+         * The compiled document already contains the CSS and the module
+         * script, so it is handed over whole. The preview panel injects the
+         * CSP and the error bridge into it exactly as it does for legacy
+         * projects, so there is one owner for both.
+         */
+        html: compiled.html,
+        css: "",
+        javascript: "",
+      },
     });
   } catch (err: unknown) {
     if (err && typeof err === "object" && "status" in err) {
