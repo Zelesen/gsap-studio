@@ -3,20 +3,30 @@
 import { useCallback, useState } from "react";
 import { RotateCw } from "lucide-react";
 
+import type { ProjectFiles } from "@/lib/storage";
+
 /*
  * CodePanel — the editable source with text tabs and a monospace editor.
  *
+ * The editor holds drafts. The preview renders the applied version. A file is
+ * marked modified when its draft differs from its applied copy, so the dot
+ * means "not in the preview yet" rather than "you typed since last keystroke",
+ * and it clears itself the moment Apply lands. Switching tabs never discards a
+ * draft: all three files live in the parent's state, only one is visible.
+ *
  * The three files are tabs on a full-width rule (the active one carries a 2px
- * ink underline, not a coloured pill). A changed file takes a small ink dot on
- * its tab and the foot states it in words. Monospace is confined to the editor
+ * ink underline, not a coloured pill). Monospace is confined to the editor
  * itself; labels stay in the text face.
  */
 
-type FileKey = "html" | "css" | "javascript";
+type FileKey = keyof ProjectFiles;
 
 interface CodePanelProps {
-  files: { html: string; css: string; javascript: string };
-  onChange: (files: { html: string; css: string; javascript: string }) => void;
+  /** Working drafts — what the editor shows. */
+  files: ProjectFiles;
+  /** The version currently rendered in the preview. */
+  applied: ProjectFiles;
+  onChange: (files: ProjectFiles) => void;
   onApply: () => void;
   isApplying: boolean;
 }
@@ -31,36 +41,24 @@ const FILE_LABELS: Record<FileKey, string> = {
 
 export default function CodePanel({
   files,
+  applied,
   onChange,
   onApply,
   isApplying,
 }: CodePanelProps) {
   const [activeFile, setActiveFile] = useState<FileKey>("html");
-  const [dirtyFiles, setDirtyFiles] = useState<Set<FileKey>>(new Set());
 
-  const isDirty = dirtyFiles.size > 0;
+  // Derived, not tracked: drafts and applied versions are the single source of
+  // truth, so the indicator cannot drift out of sync with what is rendered.
+  const dirtyFiles = FILE_KEYS.filter((key) => files[key] !== applied[key]);
+  const isDirty = dirtyFiles.length > 0;
 
   const handleChange = useCallback(
     (key: FileKey, event: React.ChangeEvent<HTMLTextAreaElement>) => {
-      const next = { ...files, [key]: event.target.value };
-      onChange(next);
-      setDirtyFiles((prev) => {
-        const nextSet = new Set(prev);
-        if (event.target.value.trim() === files[key].trim()) {
-          nextSet.delete(key);
-        } else {
-          nextSet.add(key);
-        }
-        return nextSet;
-      });
+      onChange({ ...files, [key]: event.target.value });
     },
     [files, onChange],
   );
-
-  const handleApply = useCallback(() => {
-    onApply();
-    setDirtyFiles(new Set());
-  }, [onApply]);
 
   const handleTabKeyDown = useCallback(
     (event: React.KeyboardEvent) => {
@@ -101,7 +99,7 @@ export default function CodePanel({
             onClick={() => setActiveFile(key)}
           >
             {FILE_LABELS[key]}
-            {dirtyFiles.has(key) && (
+            {files[key] !== applied[key] && (
               <span className="studio-tab__dot" aria-hidden="true" />
             )}
           </button>
@@ -130,15 +128,18 @@ export default function CodePanel({
       </div>
 
       <div className="studio-panel-foot">
-        <span className={isDirty ? "studio-hint text-blaze-text" : "studio-hint"}>
+        <span
+          className={isDirty ? "studio-hint text-blaze-text" : "studio-hint"}
+          aria-live="polite"
+        >
           {isDirty
-            ? `Edited · ${dirtyFiles.size} file${dirtyFiles.size > 1 ? "s" : ""}`
+            ? `Edited · ${dirtyFiles.length} file${dirtyFiles.length > 1 ? "s" : ""} not in the preview`
             : "Preview up to date"}
         </span>
         <button
           type="button"
           className="studio-btn"
-          onClick={handleApply}
+          onClick={onApply}
           disabled={!isDirty || isApplying}
         >
           <RotateCw aria-hidden="true" />
