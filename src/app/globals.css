@@ -1524,6 +1524,48 @@ sup {
   text-align: center;
 }
 
+/* The viewport the preview is actually rendering at, stated in numbers. */
+.studio-preview-dims {
+  font-variant-numeric: tabular-nums;
+  white-space: nowrap;
+}
+
+/* Reported by the sandboxed preview over postMessage; advisory only. */
+.studio-preview-error {
+  flex: none;
+  display: flex;
+  align-items: flex-start;
+  gap: 8px;
+  padding: 8px 16px;
+  border-top: 1px solid var(--studio-line);
+  color: var(--blaze-text);
+  font-size: 12px;
+  line-height: 18px;
+  overflow-wrap: anywhere;
+}
+
+.studio-preview-error svg {
+  width: 14px;
+  height: 14px;
+  flex: none;
+  margin-top: 2px;
+  color: var(--studio-negative);
+}
+
+.studio-preview-error__label {
+  color: var(--blaze-text);
+}
+
+.studio-preview-error__list ul {
+  margin: 2px 0 0;
+  padding: 0;
+  list-style: none;
+}
+
+.studio-preview-error__list li {
+  color: var(--blaze-muted);
+}
+
 /* ── code ── */
 
 .studio-tabs {
@@ -1642,6 +1684,13 @@ sup {
   .studio-segmented--full button {
     flex: 1 1 0;
     justify-content: center;
+  }
+}
+
+/* The preview head gets tight on small screens; the numbers give way first. */
+@media (max-width: 560px) {
+  .studio-preview-dims {
+    display: none;
   }
 }
 
