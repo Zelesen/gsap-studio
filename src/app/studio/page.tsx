@@ -9,10 +9,12 @@ import StudioLayout from "@/components/studio/StudioLayout";
 import {
   clearProject,
   createEmptyProject,
+  fromFileList,
   loadProject,
   saveProject,
+  toFileList,
 } from "@/lib/storage";
-import type { StoredProject } from "@/lib/storage";
+import type { ProjectFiles, StoredProject } from "@/lib/storage";
 
 /*
  * Studio page — AI website builder at /studio.
@@ -20,27 +22,23 @@ import type { StoredProject } from "@/lib/storage";
  * Vertical slice: prompt → real AI response → generated website → live preview.
  * All state is local (localStorage) for v1. The AI call goes through
  * /api/generate which talks to OpenRouter server-side.
+ *
+ * Code exists in two copies: `drafts` (what the editor holds) and `applied`
+ * (what the preview renders). Editing only touches drafts; Apply copies them
+ * across; a generation replaces both so new code appears immediately. Both are
+ * persisted, so a refresh restores the editor exactly as it was left — dirty
+ * markers included — while the preview keeps showing the last applied version.
  */
 
 const PROJECT_TITLE = "Website builder";
 
 /*
  * Deterministic stand-in used while the route is prerendered on the server.
- * The real project is read from localStorage on the client, so no browser API
- * (or crypto) is touched during the build's prerender pass.
+ * It carries the real starter template so the static HTML is a meaningful
+ * first paint; the client swaps in the stored project right after hydration.
+ * No browser API (or crypto) is touched during the build's prerender pass.
  */
-const SERVER_PROJECT: StoredProject = {
-  id: "pending",
-  updatedAt: 0,
-  files: [
-    { name: "index.html", content: "" },
-    { name: "style.css", content: "" },
-    { name: "script.js", content: "" },
-  ],
-  conversation: [],
-};
-
-const INITIAL_FILES = {
+const INITIAL_FILES: ProjectFiles = {
   html: `<!DOCTYPE html>
 <html lang="en">
 <head>
@@ -91,27 +89,21 @@ console.log("Studio project loaded.");
 `,
 };
 
+const SERVER_PROJECT: StoredProject = {
+  id: "pending",
+  updatedAt: 0,
+  files: toFileList(INITIAL_FILES),
+  applied: toFileList(INITIAL_FILES),
+  conversation: [],
+};
+
 export default function StudioPage() {
-  const [project, setProject] = useState<StoredProject>(() => {
-    if (typeof window === "undefined") return SERVER_PROJECT;
-    return loadProject() ?? createEmptyProject();
-  });
-
-  const [files, setFiles] = useState(() => {
-    return {
-      html:
-        project.files.find((f) => f.name === "index.html")?.content ||
-        INITIAL_FILES.html,
-      css:
-        project.files.find((f) => f.name === "style.css")?.content ||
-        INITIAL_FILES.css,
-      javascript:
-        project.files.find((f) => f.name === "script.js")?.content ||
-        INITIAL_FILES.javascript,
-    };
-  });
-
-  const [conversation, setConversation] = useState(() => project.conversation);
+  const [project, setProject] = useState<StoredProject>(SERVER_PROJECT);
+  const [drafts, setDrafts] = useState<ProjectFiles>(INITIAL_FILES);
+  const [applied, setApplied] = useState<ProjectFiles>(INITIAL_FILES);
+  const [conversation, setConversation] = useState<StoredProject["conversation"]>(
+    [],
+  );
 
   const [isLoading, setIsLoading] = useState(false);
   const [error, setError] = useState<string | null>(null);
@@ -123,21 +115,48 @@ export default function StudioPage() {
   });
 
   /*
-   * Persist the project on every change. The project is initialised from
-   * localStorage or created fresh, so a brand-new session is saved from the
-   * outset rather than only after an explicit reset.
+   * Hydration is deferred rather than read during the first render: the server
+   * and the client must agree on the initial markup, and localStorage only
+   * exists on the client. The read is queued as a microtask so it lands before
+   * the browser paints — the stored project takes over with no flash and no
+   * hydration mismatch. Persisting waits for `hydrated`, so a stored project
+   * is never overwritten by the empty server placeholder.
+   */
+  const [hydrated, setHydrated] = useState(false);
+
+  useEffect(() => {
+    queueMicrotask(() => {
+      const stored = loadProject();
+      if (stored) {
+        setProject(stored);
+        setDrafts(fromFileList(stored.files) ?? INITIAL_FILES);
+        // Projects saved before drafts were split have one copy: treat it as
+        // already applied, matching the live preview they were saved under.
+        setApplied(fromFileList(stored.applied ?? stored.files) ?? INITIAL_FILES);
+        setConversation(stored.conversation);
+      } else {
+        setProject(createEmptyProject());
+        setDrafts(INITIAL_FILES);
+        setApplied(INITIAL_FILES);
+      }
+      setHydrated(true);
+    });
+  }, []);
+
+  /*
+   * Persist the project on every change. Both copies of the code are written,
+   * so a refresh restores the drafts *and* the applied version — the preview
+   * does not silently advance to unsaved edits.
    */
   useEffect(() => {
+    if (!hydrated) return;
     saveProject({
       ...project,
-      files: [
-        { name: "index.html", content: files.html },
-        { name: "style.css", content: files.css },
-        { name: "script.js", content: files.javascript },
-      ],
+      files: toFileList(drafts),
+      applied: toFileList(applied),
       conversation,
     });
-  }, [project, files, conversation]);
+  }, [hydrated, project, drafts, applied, conversation]);
 
   const handleGenerate = useCallback(
     async (prompt: string) => {
@@ -157,9 +176,9 @@ export default function StudioPage() {
           headers: { "Content-Type": "application/json" },
           body: JSON.stringify({
             messages: [...conversation, userMsg],
-            currentHtml: files.html,
-            currentCss: files.css,
-            currentJs: files.javascript,
+            currentHtml: drafts.html,
+            currentCss: drafts.css,
+            currentJs: drafts.javascript,
           }),
         });
 
@@ -169,11 +188,15 @@ export default function StudioPage() {
           throw new Error(data.error || "Generation failed.");
         }
 
-        setFiles({
+        // Generated code replaces both copies: it is what the user asked for,
+        // so it belongs in the preview straight away with nothing to apply.
+        const generated: ProjectFiles = {
           html: data.html,
           css: data.css,
           javascript: data.javascript,
-        });
+        };
+        setDrafts(generated);
+        setApplied(generated);
         setConversation((prev) => [
           ...prev,
           {
@@ -198,25 +221,27 @@ export default function StudioPage() {
         setIsLoading(false);
       }
     },
-    [conversation, files],
+    [conversation, drafts],
   );
 
-  const handleFileChange = useCallback(
-    (next: { html: string; css: string; javascript: string }) => {
-      setFiles(next);
-    },
-    [],
-  );
-
-  const handleApply = useCallback(() => {
-    // The preview re-renders from the current files; the refresh key forces a
-    // fresh write so "Apply to preview" does something observable.
-    setError(null);
-    setRefreshKey((key) => key + 1);
+  const handleFileChange = useCallback((next: ProjectFiles) => {
+    setDrafts(next);
   }, []);
 
-  const handlePreviewError = useCallback((message: string) => {
-    setError(message);
+  /*
+   * Apply copies the drafts into the preview. The preview's own document
+   * changes with them, which is what re-renders it — there is no separate
+   * refresh counter to bump.
+   */
+  const handleApply = useCallback(() => {
+    setError(null);
+    setApplied(drafts);
+  }, [drafts]);
+
+  /* Re-render the same applied code from scratch. */
+  const handleRerender = useCallback(() => {
+    setError(null);
+    setRefreshKey((key) => key + 1);
   }, []);
 
   const handleNewProject = useCallback(() => {
@@ -227,7 +252,8 @@ export default function StudioPage() {
     ) {
       return;
     }
-    setFiles(INITIAL_FILES);
+    setDrafts(INITIAL_FILES);
+    setApplied(INITIAL_FILES);
     setConversation([]);
     setError(null);
     clearProject();
@@ -261,11 +287,10 @@ export default function StudioPage() {
         preview: {
           element: (
             <PreviewPanel
-              html={files.html}
-              css={files.css}
-              javascript={files.javascript}
-              onRefresh={handleApply}
-              onError={handlePreviewError}
+              html={applied.html}
+              css={applied.css}
+              javascript={applied.javascript}
+              onRefresh={handleRerender}
               refreshKey={refreshKey}
             />
           ),
@@ -274,7 +299,8 @@ export default function StudioPage() {
         code: {
           element: (
             <CodePanel
-              files={files}
+              files={drafts}
+              applied={applied}
               onChange={handleFileChange}
               onApply={handleApply}
               isApplying={isLoading}
