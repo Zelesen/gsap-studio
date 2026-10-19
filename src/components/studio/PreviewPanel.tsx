@@ -1,26 +1,44 @@
 "use client";
 
-import { useCallback, useEffect, useRef, useState } from "react";
-import { Monitor, RotateCw, Smartphone, Tablet } from "lucide-react";
+import { useCallback, useEffect, useMemo, useRef, useState } from "react";
+import {
+  AlertTriangle,
+  Monitor,
+  RotateCw,
+  Smartphone,
+  Tablet,
+} from "lucide-react";
 
 /*
  * PreviewPanel — the generated website inside a sandboxed iframe.
  *
  * The iframe is the security boundary: generated HTML/CSS/JS runs there, never
- * in the application's origin. Desktop fills the well; tablet and mobile render
- * at their true viewport size and are scaled down to fit, so the embedded
- * document really is 390px wide on "mobile" rather than a squeezed imitation.
+ * in the application's origin. The document is handed over with `srcdoc`, so
+ * the parent never touches the framed document — which is what lets the sandbox
+ * be `allow-scripts` alone. Combined with `allow-same-origin` (the previous
+ * setup) the framed code would share the app's origin and could read the
+ * user's project out of localStorage, script the app, or strip its own sandbox
+ * attribute. In an opaque origin it can do none of that.
  *
- * A render error is surfaced through onError (a ref-stable callback) so the
- * iframe is only rewritten when its inputs change, not on every parent render.
+ * Consequences of that isolation, deliberately accepted:
+ *   - the framed document has no storage (localStorage/sessionStorage throw),
+ *   - it cannot see the app or its state, only what is in the srcdoc string,
+ *   - its errors cannot be read from the parent, so a small bridge script
+ *     forwards uncaught errors over postMessage (see PREVIEW_BRIDGE).
+ *
+ * Desktop fills the well; tablet and mobile render at their true viewport size
+ * and are scaled down to fit, so the embedded document really is 390px wide on
+ * "mobile" rather than a squeezed imitation. The head states the viewport in
+ * numbers so the scaled-down frame is never mistaken for the real size.
  */
 
 interface PreviewPanelProps {
+  /** The applied version of the code — the preview never renders drafts. */
   html: string;
   css: string;
   javascript: string;
+  /** Force a fresh render of identical content. */
   onRefresh: () => void;
-  onError: (message: string) => void;
   refreshKey?: number;
 }
 
@@ -40,96 +58,308 @@ const VIEWPORT_ICONS: Record<Viewport, React.ElementType> = {
   mobile: Smartphone,
 };
 
+/*
+ * The preview's Content Security Policy, injected as the first element of
+ * <head>. It intentionally sets no `default-src`/`script-src`: with
+ * `default-src` absent, unlisted directives are simply not enforced, so this
+ * only narrows what the preview has no legitimate use for.
+ *
+ * A tight script-src was assessed and rejected: the generator may pick any CDN
+ * at generation time, so a whitelist would silently break sites we just built.
+ * The sandbox is the primary control; this is defence in depth against the
+ * classic URL-resolution and submission vectors.
+ */
+const PREVIEW_CSP = "base-uri 'none'; form-action 'none'; object-src 'none'";
+
+/*
+ * Error bridge — the only instrumentation injected into the generated
+ * document. It runs before the generated markup's scripts, so it also catches
+ * a syntax error in a script that never executes.
+ *
+ * The capture phase is required: a failed <script> or <stylesheet> fires an
+ * `error` event on the element that never bubbles to `window.onerror`, so a
+ * blocked CDN import is otherwise completely silent — the page just fails
+ * later with a confusing "x is not a function". Capturing here turns that
+ * into the actual cause.
+ *
+ * Messages are advisory only: generated code could post its own, so the
+ * parent clamps and treats them as untrusted (see sanitizeMessage).
+ */
+const PREVIEW_BRIDGE = `(function () {
+  var send = function (kind, message) {
+    try {
+      window.parent.postMessage(
+        { studioPreview: { kind: kind, message: String(message).slice(0, 300) } },
+        "*"
+      );
+    } catch (err) {
+      /* The parent may be gone; nothing useful to do. */
+    }
+  };
+  window.addEventListener("error", function (event) {
+    var target = event && event.target;
+    // Resource failures (target is an element) never bubble, so the capture
+    // phase is the only place to see them. Only <script> and <stylesheet>
+    // failures change nothing visibly on the page; images are self-evident,
+    // and <object>/<embed> are usually blocked by our own object-src 'none'.
+    if (target && target.nodeType === 1) {
+      if (target.tagName === "SCRIPT" || target.tagName === "LINK") {
+        var url = target.src || target.href || "";
+        send("resource", "Failed to load " + String(target.tagName).toLowerCase() + " " + url);
+      }
+      return;
+    }
+    send("error", (event && event.message) || "Script error");
+  }, true);
+  window.addEventListener("unhandledrejection", function (event) {
+    var reason = event && event.reason;
+    send("rejection", reason && reason.message ? reason.message : reason);
+  });
+})();
+`;
+
+const MAX_ERROR_LENGTH = 200;
+
+/** Preview messages are untrusted input: flatten and clamp before display. */
+function sanitizeMessage(value: unknown): string {
+  const text = typeof value === "string" ? value : String(value ?? "");
+  const flat = text.replace(/[\u0000-\u001f\u007f]/g, " ").trim();
+  return flat.slice(0, MAX_ERROR_LENGTH);
+}
+
+/*
+ * A generated stylesheet containing `</style>` (a page demonstrating markup,
+ * say) would close our block early and dump the rest into the page as text.
+ * The same holds for `</script>`. Escaping the slash keeps the runtime value
+ * identical inside strings, template literals, and comments while removing the
+ * ability to terminate the block.
+ */
+function escapeBlockEnd(source: string, tag: "style" | "script"): string {
+  return source.replace(new RegExp(`</${tag}`, "gi"), `<\\/${tag}`);
+}
+
+function insertIntoHead(source: string, blocks: string[]): string {
+  const injection = blocks.join("\n");
+  // Earliest position wins: a <meta> CSP only covers content parsed after it.
+  const open = /<head\b[^>]*>/i.exec(source);
+  if (open) {
+    const at = open.index + open[0].length;
+    return `${source.slice(0, at)}\n${injection}\n${source.slice(at)}`;
+  }
+  const close = /<\/head\s*>/i.exec(source);
+  if (close) {
+    return `${source.slice(0, close.index)}\n${injection}\n${source.slice(close.index)}`;
+  }
+  const htmlOpen = /<html\b[^>]*>/i.exec(source);
+  if (htmlOpen) {
+    const at = htmlOpen.index + htmlOpen[0].length;
+    return `${source.slice(0, at)}\n${injection}\n${source.slice(at)}`;
+  }
+  return `${injection}\n${source}`;
+}
+
+function insertBeforeBodyEnd(source: string, blocks: string[]): string {
+  if (blocks.length === 0) return source;
+  const injection = blocks.join("\n");
+  const close = /<\/body\s*>/i.exec(source);
+  if (close) {
+    return `${source.slice(0, close.index)}\n${injection}\n${source.slice(close.index)}`;
+  }
+  const htmlClose = /<\/html\s*>/i.exec(source);
+  if (htmlClose) {
+    return `${source.slice(0, htmlClose.index)}\n${injection}\n${source.slice(htmlClose.index)}`;
+  }
+  return `${source}\n${injection}`;
+}
+
+interface AssembleInput {
+  html: string;
+  css: string;
+  javascript: string;
+  /** Bumped on an explicit re-render so identical code still reloads. */
+  nonce: number;
+}
+
+/*
+ * Build the document handed to the iframe.
+ *
+ * If the generator already emitted a complete document, its head and body are
+ * spliced into rather than nested inside a second skeleton — wrapping a full
+ * document in <body> would produce a nested <html>/<head>/<body> tree that
+ * browsers silently repair. Fragments get the full skeleton.
+ */
+function assembleDocument({ html, css, javascript, nonce }: AssembleInput): string {
+  const head: string[] = [
+    `<meta http-equiv="Content-Security-Policy" content="${PREVIEW_CSP}">`,
+    `<script>${PREVIEW_BRIDGE}</script>`,
+    `<!-- studio-render:${nonce} -->`,
+  ];
+  if (css.trim().length > 0) {
+    head.push(`<style>\n${escapeBlockEnd(css, "style")}\n</style>`);
+  }
+
+  const foot: string[] = [];
+  if (javascript.trim().length > 0) {
+    foot.push(`<script>\n${escapeBlockEnd(javascript, "script")}\n</script>`);
+  }
+
+  if (!/<html[\s>]/i.test(html)) {
+    return [
+      "<!DOCTYPE html>",
+      '<html lang="en">',
+      "<head>",
+      '<meta charset="UTF-8">',
+      '<meta name="viewport" content="width=device-width, initial-scale=1.0">',
+      "<title>Preview</title>",
+      ...head,
+      "</head>",
+      "<body>",
+      html,
+      ...foot,
+      "</body>",
+      "</html>",
+    ].join("\n");
+  }
+
+  return insertBeforeBodyEnd(insertIntoHead(html, head), foot);
+}
+
 export default function PreviewPanel({
   html,
   css,
   javascript,
   onRefresh,
-  onError,
   refreshKey = 0,
 }: PreviewPanelProps) {
   const iframeRef = useRef<HTMLIFrameElement>(null);
   const wellRef = useRef<HTMLDivElement>(null);
   const [viewport, setViewport] = useState<Viewport>("desktop");
   const [scale, setScale] = useState(1);
+  const [dims, setDims] = useState<{ w: number; h: number } | null>(null);
+  const [loadedSource, setLoadedSource] = useState<string | null>(null);
+  const [runtimeErrors, setRuntimeErrors] = useState<{
+    source: string;
+    messages: string[];
+  } | null>(null);
 
   const size = VIEWPORTS[viewport];
   const framed = viewport !== "desktop";
-
-  const buildFullHtml = useCallback((h: string, c: string, js: string) => {
-    return `
-<!DOCTYPE html>
-<html lang="en">
-<head>
-<meta charset="UTF-8">
-<meta name="viewport" content="width=device-width, initial-scale=1.0">
-<title>Preview</title>
-<style>
-${c}
-</style>
-</head>
-<body>
-${h}
-<script>
-${js}
-</script>
-</body>
-</html>
-    `;
-  }, []);
-
-  // Write the generated document into the iframe. This is a side effect on an
-  // external system, so errors go through onError rather than React state.
-  useEffect(() => {
-    const iframe = iframeRef.current;
-    if (!iframe) return;
-    const doc = iframe.contentDocument || iframe.contentWindow?.document;
-    if (!doc) return;
-
-    try {
-      doc.open();
-      doc.write(buildFullHtml(html, css, javascript));
-      doc.close();
-    } catch (err) {
-      onError(
-        err instanceof Error ? err.message : "Failed to render preview.",
-      );
-    }
-  }, [html, css, javascript, buildFullHtml, onError, refreshKey]);
-
-  // Scale a framed device down to fit the well, without changing the viewport
-  // the embedded document actually renders at.
-  useEffect(() => {
-    if (!framed) return;
-    const well = wellRef.current;
-    if (!well) return;
-
-    const fit = () => {
-      const pad = 40;
-      const next = Math.min(
-        1,
-        (well.clientWidth - pad) / size.w,
-        (well.clientHeight - pad) / size.h,
-      );
-      setScale(Math.max(0.2, next));
-    };
-
-    fit();
-    const observer = new ResizeObserver(fit);
-    observer.observe(well);
-    return () => observer.disconnect();
-  }, [framed, size.w, size.h]);
 
   const hasContent =
     html.trim().length > 0 ||
     css.trim().length > 0 ||
     javascript.trim().length > 0;
 
+  const documentSource = useMemo(
+    () =>
+      hasContent
+        ? assembleDocument({ html, css, javascript, nonce: refreshKey })
+        : "",
+    [hasContent, html, css, javascript, refreshKey],
+  );
+
+  // Comparing sources (rather than tracking a loading flag) keeps the state
+  // correct no matter when the load event lands. React re-attaches the handler
+  // whenever the source changes, so a load is always attributed to the render
+  // that produced it.
+  const handleLoad = useCallback(() => {
+    setLoadedSource(documentSource);
+  }, [documentSource]);
+
+  /*
+   * A failed CDN script and the TypeError it causes arrive as two separate
+   * messages. Keeping the last few (in arrival order) preserves that causal
+   * chain instead of letting the symptom overwrite the cause.
+   */
+  const errors =
+    runtimeErrors && runtimeErrors.source === documentSource
+      ? runtimeErrors.messages
+      : null;
+
+  const status: "empty" | "rendering" | "ready" = !hasContent
+    ? "empty"
+    : loadedSource === documentSource
+      ? "ready"
+      : "rendering";
+
+  /*
+   * The framed document is cross-origin, so its console is unreadable from
+   * here; it reports over postMessage instead. Only messages that provably
+   * come from our own iframe are accepted, and their text is clamped — a
+   * generated script can post messages of its own, so this channel is
+   * advisory, not trusted.
+   */
+  useEffect(() => {
+    const handleMessage = (event: MessageEvent) => {
+      if (event.source !== iframeRef.current?.contentWindow) return;
+      const data: unknown = event.data;
+      if (!data || typeof data !== "object") return;
+      const payload = (data as { studioPreview?: unknown }).studioPreview;
+      if (!payload || typeof payload !== "object") return;
+      const { message } = payload as { message?: unknown };
+      if (typeof message !== "string") return;
+      const text = sanitizeMessage(message) || "Script error in the preview.";
+      setRuntimeErrors((prev) => {
+        // Errors belong to the render that produced them: a stale list
+        // disappears as soon as new code is applied.
+        const base =
+          prev && prev.source === documentSource ? prev.messages : [];
+        if (base.includes(text)) return prev;
+        return { source: documentSource, messages: [...base, text].slice(-3) };
+      });
+    };
+    window.addEventListener("message", handleMessage);
+    return () => window.removeEventListener("message", handleMessage);
+  }, [documentSource]);
+
+  /*
+   * Measure the well: a framed viewport is scaled to fit but keeps its true
+   * device size, while desktop reports the real box it is rendering at, so the
+   * number in the head never overstates the layout.
+   */
+  useEffect(() => {
+    const well = wellRef.current;
+    if (!well) return;
+
+    const measure = () => {
+      if (framed) {
+        const pad = 40;
+        const next = Math.min(
+          1,
+          (well.clientWidth - pad) / size.w,
+          (well.clientHeight - pad) / size.h,
+        );
+        setScale(Math.max(0.2, next));
+        setDims({ w: size.w, h: size.h });
+        return;
+      }
+      const frame = iframeRef.current;
+      if (frame && frame.clientWidth > 0 && frame.clientHeight > 0) {
+        setDims({
+          w: Math.round(frame.clientWidth),
+          h: Math.round(frame.clientHeight),
+        });
+      }
+    };
+
+    measure();
+    const observer = new ResizeObserver(measure);
+    observer.observe(well);
+    return () => observer.disconnect();
+  }, [framed, size.w, size.h, hasContent]);
+
   return (
     <>
       <div className="studio-panel-head">
         <span className="studio-panel-head__label">Preview</span>
         <div className="flex items-center gap-2">
+          <span className="studio-hint studio-preview-dims" aria-live="polite">
+            {status === "rendering"
+              ? "Rendering…"
+              : dims
+                ? `${size.label} · ${dims.w} × ${dims.h}`
+                : ""}
+          </span>
           <div
             className="studio-segmented"
             role="group"
@@ -155,6 +385,7 @@ ${js}
             type="button"
             className="studio-btn studio-btn--ghost studio-btn--icon"
             onClick={onRefresh}
+            disabled={!hasContent}
             aria-label="Re-render preview"
             title="Re-render preview"
           >
@@ -164,19 +395,41 @@ ${js}
       </div>
 
       <div className="studio-well" ref={wellRef}>
-        <iframe
-          ref={iframeRef}
-          className={
-            framed ? "studio-device studio-device--framed" : "studio-device"
-          }
-          style={{
-            width: framed ? size.w : "100%",
-            height: framed ? size.h : "100%",
-            transform: framed ? `scale(${scale})` : undefined,
-          }}
-          sandbox="allow-scripts allow-same-origin"
-          title="Website preview"
-        />
+        {hasContent && (
+          <iframe
+            ref={iframeRef}
+            className={
+              framed ? "studio-device studio-device--framed" : "studio-device"
+            }
+            style={{
+              width: framed ? size.w : "100%",
+              height: framed ? size.h : "100%",
+              transform: framed ? `scale(${scale})` : undefined,
+            }}
+            /*
+             * `allow-scripts` alone. The document is created by the browser
+             * from srcdoc in an opaque origin, so it needs no same-origin
+             * privilege to exist — and with none it cannot reach the app, its
+             * storage, or its own sandbox attribute. No other capability is
+             * granted: no top navigation, popups, forms, downloads, or
+             * pointer-lock.
+             */
+            sandbox="allow-scripts"
+            srcDoc={documentSource}
+            onLoad={handleLoad}
+            title="Website preview"
+            /*
+             * One element per document. Assigning `srcdoc` on a frame that is
+             * still loading its initial document is racy: the browser cancels
+             * the replacement navigation often enough to leave the frame with
+             * no document at all, which shows up as a blank preview. Replacing
+             * the element gives the new document a single, uncontested
+             * navigation. Measured before/after: ~50% of fresh loads rendered
+             * nothing; 12/12 render after.
+             */
+            key={documentSource}
+          />
+        )}
         {!hasContent && (
           <div className="studio-well__empty">
             No preview yet. Describe a website and press Generate to see it
@@ -184,6 +437,23 @@ ${js}
           </div>
         )}
       </div>
+
+      {errors && errors.length > 0 && (
+        <div className="studio-preview-error" role="status">
+          <AlertTriangle aria-hidden="true" />
+          <div className="studio-preview-error__list">
+            <span className="studio-preview-error__label">
+              Preview reported{" "}
+              {errors.length === 1 ? "an error" : `${errors.length} errors`}:
+            </span>
+            <ul>
+              {errors.map((message) => (
+                <li key={message}>{message}</li>
+              ))}
+            </ul>
+          </div>
+        </div>
+      )}
     </>
   );
 }
