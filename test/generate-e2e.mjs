@@ -9,8 +9,9 @@
  */
 import { spawn } from "node:child_process";
 import { setTimeout as sleep } from "node:timers/promises";
+import { startStudioServer } from "./helpers/server.mjs";
 
-const APP = "http://127.0.0.1:3100";
+const APP = "http://127.0.0.1:3110";
 const STUB_PORT = 8125;
 
 let passed = 0;
@@ -203,6 +204,8 @@ check(
 
 console.log("\n=== /api/compile endpoint ===");
 
+const server = await startStudioServer();
+
 try {
   const res = await fetch(`${APP}/api/compile`, {
     method: "POST",
@@ -248,6 +251,8 @@ try {
 }
 
 console.log(`\n=== RESULTS: ${passed} passed, ${failed} failed ===`);
+
+await server.stop();
 
 // Stop esbuild's background service so Node can exit cleanly on Windows.
 try {

@@ -7,9 +7,10 @@
 import { spawn } from "node:child_process";
 import { rmSync } from "node:fs";
 import { setTimeout as sleep } from "node:timers/promises";
+import { startStudioServer } from "./helpers/server.mjs";
 
 const EDGE = "C:\\Program Files (x86)\\Microsoft\\Edge\\Application\\msedge.exe";
-const APP = "http://127.0.0.1:3100";
+const APP = "http://127.0.0.1:3110";
 const PORT = 9334;
 const PROFILE = "C:\\Users\\amanm\\AppData\\Local\\Temp\\opencode\\studio-m31-browser";
 const STORAGE_KEY = "gsap_studio_project_v1";
@@ -150,7 +151,10 @@ const edge = spawn(EDGE, [
 ], { stdio: "ignore" });
 
 let cdp;
+let server;
 try {
+  server = await startStudioServer();
+
   console.log("=== compile the generated project ===");
   const compileRes = await fetch(`${APP}/api/compile`, {
     method: "POST",
@@ -274,6 +278,7 @@ try {
 } finally {
   try { cdp?.ws?.close(); } catch {}
   try { edge.kill(); } catch {}
+  if (server) await server.stop();
   await sleep(400);
   try { rmSync(PROFILE, { recursive: true, force: true }); } catch {}
 }
