@@ -1,3 +1,15 @@
+if (typeof window === "undefined") {
+  // One-time diagnostic so you can confirm which provider and key the server
+  // is actually using (visible in the next dev terminal output). Never throws:
+  // missing keys surface as configuration_error at request time.
+  try {
+    console.log(
+      `[gsap-studio] AI provider: ${resolveProvider()} · key prefix: ${(providerApiKey(resolveProvider()).slice(0, 12))}...`,
+    );
+  } catch {
+    console.log(`[gsap-studio] AI provider: ${resolveProvider()} · key: missing`);
+  }
+}
 ﻿/*
  * OpenRouter provider adapter â€” OpenAI-compatible chat completions.
  *
@@ -18,7 +30,55 @@ export interface Message {
   content: string;
 }
 
+export type AIProvider = "openrouter" | "openai" | "google";
+
 export type { ProjectResult, ProjectManifest, ProjectFile, APPROVED_DEPENDENCIES, isApprovedImport, validateProjectResult } from "@/lib/project";
+
+/* Google (Gemini) model id: body wins, then `GOOGLE_MODEL` env, then default. */
+export const GOOGLE_MODEL_DEFAULT = "gemini-3.6-flash";
+
+/** Resolve the Gemini API key (`GOOGLE_API_KEY`, `GOOGLE_MODAL` alias kept). */
+export function googleApiKey(): string {
+  return getEnv("GOOGLE_API_KEY", ["GOOGLE_MODAL"]);
+}
+
+/**
+ * Convert a chat-style transcript to Gemini `contents`.
+ * Gemini roles are only "user" | "model": system turns become user turns
+ * (Gemini's systemInstruction could host them, but folding keeps one path).
+ * Consecutive same-role turns are merged, since Gemini requires alternation.
+ */
+export function toGeminiContents(messages: Message[]): Array<{
+  role: "user" | "model";
+  parts: Array<{ text: string }>;
+}> {
+  const contents: Array<{
+    role: "user" | "model";
+    parts: Array<{ text: string }>;
+  }> = [];
+  for (const m of messages) {
+    const role = m.role === "assistant" ? "model" : "user";
+    const last = contents[contents.length - 1];
+    if (last && last.role === role) {
+      last.parts.push({ text: m.content });
+    } else {
+      contents.push({ role, parts: [{ text: m.content }] });
+    }
+  }
+  return contents;
+}
+
+interface GeminiPart {
+  text?: string;
+}
+interface GeminiCandidate {
+  content?: { parts?: GeminiPart[] };
+  finishReason?: string;
+}
+interface GeminiResponse {
+  candidates?: GeminiCandidate[];
+  error?: { message?: string; status?: string; code?: number };
+}
 
 const REACT_SYSTEM_PROMPT = `You are an expert React + TypeScript engineer. You build complete, single-page websites from natural language descriptions.
 
@@ -31,7 +91,7 @@ manifest:
 - dependencies: Only these packages are allowed:
     react, react-dom, react-dom/client, react/jsx-runtime,
     gsap, gsap/ScrollTrigger, @gsap/react
-- framework: "react-ts"
+- framework: must be exactly the string "react-ts" (the only supported value — double-check it before answering)
 
 files: Array of { path: string, content: string }
 - Must include the entry point specified in manifest
@@ -74,30 +134,57 @@ interface OpenRouterResponse {
   };
 }
 
-class OpenRouterError extends Error {
+class AIError extends Error {
   public readonly status: number;
   public readonly type?: string;
   public readonly code?: number;
 
   constructor(message: string, status: number, type?: string, code?: number) {
     super(message);
-    this.name = "OpenRouterError";
+    this.name = "AIError";
     this.status = status;
     this.type = type;
     this.code = code;
   }
 }
 
-function getEnv(key: string): string {
-  const value = process.env[key];
-  if (!value) {
-    throw new OpenRouterError(
-      `Missing environment variable: ${key}`,
-      500,
-      "configuration_error",
-    );
-  }
-  return value;
+/* Backward-compatible alias; the generate route uses duck typing ("status" in err). */
+class OpenRouterError extends AIError {}
+
+function getEnv(key: string, fallbacks: string[] = []): string {
+  const direct = process.env[key];
+  if (direct) return direct.trim();
+  const fallbackName = fallbacks.find((f) => Boolean(process.env[f]));
+  if (fallbackName) return process.env[fallbackName]!.trim();
+  throw new AIError(
+    `Missing environment variable: ${key}${fallbacks.length > 0 ? ` (tried ${fallbacks.join(", ")})` : ""}`,
+    500,
+    "configuration_error",
+  );
+}
+
+/*
+ * Provider selection: explicit argument wins, then `AI_PROVIDER` env, then
+ * OpenRouter (the existing default, so nothing changes unless opted in).
+ */
+function resolveProvider(explicit?: AIProvider): AIProvider {
+  if (explicit === "google" || explicit === "openai" || explicit === "openrouter")
+    return explicit;
+  const env = process.env.AI_PROVIDER?.trim().toLowerCase();
+  if (env === "google" || env === "openai" || env === "openrouter") return env;
+  return "openrouter";
+}
+
+function providerBaseUrl(provider: AIProvider): string {
+  return provider === "openai"
+    ? "https://api.openai.com/v1/chat/completions"
+    : "https://openrouter.ai/api/v1/chat/completions";
+}
+
+function providerApiKey(provider: AIProvider): string {
+  return provider === "openai"
+    ? getEnv("OPENAI_API_KEY", ["OPEN_AI_API_KEY"])
+    : getEnv("OPENROUTER_API_KEY");
 }
 
 function parseProjectResult(raw: string): ProjectResult {
@@ -155,8 +242,14 @@ function parseProjectResult(raw: string): ProjectResult {
 export async function generateReactProject(
   messages: Message[],
   model: string,
+  options?: { provider?: AIProvider },
 ): Promise<ProjectResult> {
-  const apiKey = getEnv("OPENROUTER_API_KEY");
+  const provider = resolveProvider(options?.provider);
+  if (provider === "google") {
+    return generateGeminiProject(messages, model);
+  }
+  const apiKey = providerApiKey(provider);
+  const baseUrl = providerBaseUrl(provider);
 
   const body: OpenRouterChatCompletion = {
     model,
@@ -166,6 +259,16 @@ export async function generateReactProject(
     response_format: { type: "json_object" },
   };
 
+  // OpenRouter-specific referral headers are unnecessary (and ignored) for
+  // OpenAI; only attach them for the OpenRouter provider.
+  const extraHeaders: Record<string, string> =
+    provider === "openrouter"
+      ? {
+          "HTTP-Referer": "https://gsap-studio.local",
+          "X-Title": "GSAP Studio AI Website Builder",
+        }
+      : {};
+
   let controller: AbortController | null = null;
   const timeoutMs = 120000;
 
@@ -173,13 +276,12 @@ export async function generateReactProject(
     controller = new AbortController();
     const timeoutId = setTimeout(() => controller?.abort(), timeoutMs);
 
-    const response = await fetch("https://openrouter.ai/api/v1/chat/completions", {
+    const response = await fetch(baseUrl, {
       method: "POST",
       headers: {
         Authorization: `Bearer ${apiKey}`,
         "Content-Type": "application/json",
-        "HTTP-Referer": "https://gsap-studio.local",
-        "X-Title": "GSAP Studio AI Website Builder",
+        ...extraHeaders,
       },
       body: JSON.stringify(body),
       signal: controller.signal,
@@ -188,7 +290,7 @@ export async function generateReactProject(
     clearTimeout(timeoutId);
 
     if (!response.ok) {
-      let errorMessage = `OpenRouter API error (${response.status})`;
+      let errorMessage = `${provider} API error (${response.status})`;
       let errorType: string | undefined;
       let errorCode: number | undefined;
 
@@ -201,14 +303,14 @@ export async function generateReactProject(
         // Ignore parse errors on error responses
       }
 
-      throw new OpenRouterError(errorMessage, response.status, errorType, errorCode);
+      throw new AIError(errorMessage, response.status, errorType, errorCode);
     }
 
     const data: OpenRouterResponse = await response.json();
 
     if (data.error) {
-      throw new OpenRouterError(
-        data.error.message || "OpenRouter returned an error.",
+      throw new AIError(
+        data.error.message || `${provider} returned an error.`,
         data.error.code || 502,
         data.error.type,
         data.error.code,
@@ -217,36 +319,119 @@ export async function generateReactProject(
 
     const content = data.choices?.[0]?.message?.content;
     if (!content || typeof content !== "string") {
-      throw new OpenRouterError(
-        "Model returned no content.",
-        502,
-        "invalid_response",
-      );
+      throw new AIError("Model returned no content.", 502, "invalid_response");
     }
 
     return parseProjectResult(content);
   } catch (err) {
-    if (err instanceof OpenRouterError) {
+    if (err instanceof AIError) {
       throw err;
     }
     if (err instanceof Error) {
       if (err.name === "AbortError") {
-        throw new OpenRouterError(
+        throw new AIError(
           "Request timed out. Please try again.",
           504,
           "timeout",
         );
       }
-      throw new OpenRouterError(
-        `Unexpected error: ${err.message}`,
-        500,
-        "unknown",
-      );
+      throw new AIError(`Unexpected error: ${err.message}`, 500, "unknown");
     }
-    throw new OpenRouterError("Unknown error occurred.", 500, "unknown");
+    throw new AIError("Unknown error occurred.", 500, "unknown");
   } finally {
     controller = null;
   }
 }
 
-export { OpenRouterError, REACT_SYSTEM_PROMPT };
+/* - end of provider adapters - */
+
+/*
+ * Google (Gemini) provider. Unlike OpenRouter/OpenAI (OpenAI-compatible
+ * chat/completions with Bearer auth), Gemini uses generateContent with the
+ * key in `x-goog-api-key`, a different payload (`contents` with user/model
+ * roles), and a different response shape (`candidates[].content.parts`).
+ * Response validation is shared (`parseProjectResult`) once text is out.
+ */
+async function generateGeminiProject(
+  messages: Message[],
+  model: string,
+): Promise<ProjectResult> {
+  const apiKey = googleApiKey();
+  const cleanModel = model.includes("/") ? model.split("/").pop()! : model;
+  const url = `https://generativelanguage.googleapis.com/v1beta/models/${encodeURIComponent(cleanModel)}:generateContent`;
+
+  const body = {
+    contents: toGeminiContents(messages),
+    generationConfig: { temperature: 0.4, maxOutputTokens: 12000 },
+  };
+
+  let controller: AbortController | null = null;
+  const timeoutMs = 120000;
+
+  try {
+    controller = new AbortController();
+    const timeoutId = setTimeout(() => controller?.abort(), timeoutMs);
+
+    const response = await fetch(url, {
+      method: "POST",
+      headers: {
+        "Content-Type": "application/json",
+        "x-goog-api-key": apiKey,
+      },
+      body: JSON.stringify(body),
+      signal: controller.signal,
+    });
+
+    clearTimeout(timeoutId);
+
+    if (!response.ok) {
+      let errorMessage = `google API error (${response.status})`;
+      try {
+        const errorBody = (await response.json()) as GeminiResponse;
+        errorMessage = errorBody.error?.message || errorMessage;
+      } catch {
+        // Ignore parse errors on error responses
+      }
+      throw new AIError(errorMessage, response.status, "google_error");
+    }
+
+    const data = (await response.json()) as GeminiResponse;
+    if (data.error) {
+      throw new AIError(
+        data.error.message || "google returned an error.",
+        data.error.code || 502,
+        data.error.status,
+      );
+    }
+
+    const parts = data.candidates?.[0]?.content?.parts ?? [];
+    const content = parts
+      .map((p) => p.text ?? "")
+      .join("")
+      .trim();
+    if (!content) {
+      throw new AIError("Model returned no content.", 502, "invalid_response");
+    }
+
+    return parseProjectResult(content);
+  } catch (err) {
+    if (err instanceof AIError) {
+      throw err;
+    }
+    if (err instanceof Error) {
+      if (err.name === "AbortError") {
+        throw new AIError(
+          "Request timed out. Please try again.",
+          504,
+          "timeout",
+        );
+      }
+      throw new AIError(`Unexpected error: ${err.message}`, 500, "unknown");
+    }
+    throw new AIError("Unknown error occurred.", 500, "unknown");
+  } finally {
+    controller = null;
+  }
+}
+
+export { AIError, OpenRouterError, REACT_SYSTEM_PROMPT };

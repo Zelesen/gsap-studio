@@ -7,29 +7,12 @@ import {
   RotateCw,
   Smartphone,
   Tablet,
+  ExternalLink,
+  Sparkles,
 } from "lucide-react";
 
 /*
  * PreviewPanel — the generated website inside a sandboxed iframe.
- *
- * The iframe is the security boundary: generated HTML/CSS/JS runs there, never
- * in the application's origin. The document is handed over with `srcdoc`, so
- * the parent never touches the framed document — which is what lets the sandbox
- * be `allow-scripts` alone. Combined with `allow-same-origin` (the previous
- * setup) the framed code would share the app's origin and could read the
- * user's project out of localStorage, script the app, or strip its own sandbox
- * attribute. In an opaque origin it can do none of that.
- *
- * Consequences of that isolation, deliberately accepted:
- *   - the framed document has no storage (localStorage/sessionStorage throw),
- *   - it cannot see the app or its state, only what is in the srcdoc string,
- *   - its errors cannot be read from the parent, so a small bridge script
- *     forwards uncaught errors over postMessage (see PREVIEW_BRIDGE).
- *
- * Desktop fills the well; tablet and mobile render at their true viewport size
- * and are scaled down to fit, so the embedded document really is 390px wide on
- * "mobile" rather than a squeezed imitation. The head states the viewport in
- * numbers so the scaled-down frame is never mistaken for the real size.
  */
 
 interface PreviewPanelProps {
@@ -58,33 +41,8 @@ const VIEWPORT_ICONS: Record<Viewport, React.ElementType> = {
   mobile: Smartphone,
 };
 
-/*
- * The preview's Content Security Policy, injected as the first element of
- * <head>. It intentionally sets no `default-src`/`script-src`: with
- * `default-src` absent, unlisted directives are simply not enforced, so this
- * only narrows what the preview has no legitimate use for.
- *
- * A tight script-src was assessed and rejected: the generator may pick any CDN
- * at generation time, so a whitelist would silently break sites we just built.
- * The sandbox is the primary control; this is defence in depth against the
- * classic URL-resolution and submission vectors.
- */
 const PREVIEW_CSP = "base-uri 'none'; form-action 'none'; object-src 'none'";
 
-/*
- * Error bridge — the only instrumentation injected into the generated
- * document. It runs before the generated markup's scripts, so it also catches
- * a syntax error in a script that never executes.
- *
- * The capture phase is required: a failed <script> or <stylesheet> fires an
- * `error` event on the element that never bubbles to `window.onerror`, so a
- * blocked CDN import is otherwise completely silent — the page just fails
- * later with a confusing "x is not a function". Capturing here turns that
- * into the actual cause.
- *
- * Messages are advisory only: generated code could post its own, so the
- * parent clamps and treats them as untrusted (see sanitizeMessage).
- */
 const PREVIEW_BRIDGE = `(function () {
   var send = function (kind, message) {
     try {
@@ -98,10 +56,6 @@ const PREVIEW_BRIDGE = `(function () {
   };
   window.addEventListener("error", function (event) {
     var target = event && event.target;
-    // Resource failures (target is an element) never bubble, so the capture
-    // phase is the only place to see them. Only <script> and <stylesheet>
-    // failures change nothing visibly on the page; images are self-evident,
-    // and <object>/<embed> are usually blocked by our own object-src 'none'.
     if (target && target.nodeType === 1) {
       if (target.tagName === "SCRIPT" || target.tagName === "LINK") {
         var url = target.src || target.href || "";
@@ -120,27 +74,18 @@ const PREVIEW_BRIDGE = `(function () {
 
 const MAX_ERROR_LENGTH = 200;
 
-/** Preview messages are untrusted input: flatten and clamp before display. */
 function sanitizeMessage(value: unknown): string {
   const text = typeof value === "string" ? value : String(value ?? "");
   const flat = text.replace(/[\u0000-\u001f\u007f]/g, " ").trim();
   return flat.slice(0, MAX_ERROR_LENGTH);
 }
 
-/*
- * A generated stylesheet containing `</style>` (a page demonstrating markup,
- * say) would close our block early and dump the rest into the page as text.
- * The same holds for `</script>`. Escaping the slash keeps the runtime value
- * identical inside strings, template literals, and comments while removing the
- * ability to terminate the block.
- */
 function escapeBlockEnd(source: string, tag: "style" | "script"): string {
   return source.replace(new RegExp(`</${tag}`, "gi"), `<\\/${tag}`);
 }
 
 function insertIntoHead(source: string, blocks: string[]): string {
   const injection = blocks.join("\n");
-  // Earliest position wins: a <meta> CSP only covers content parsed after it.
   const open = /<head\b[^>]*>/i.exec(source);
   if (open) {
     const at = open.index + open[0].length;
@@ -176,18 +121,9 @@ interface AssembleInput {
   html: string;
   css: string;
   javascript: string;
-  /** Bumped on an explicit re-render so identical code still reloads. */
   nonce: number;
 }
 
-/*
- * Build the document handed to the iframe.
- *
- * If the generator already emitted a complete document, its head and body are
- * spliced into rather than nested inside a second skeleton — wrapping a full
- * document in <body> would produce a nested <html>/<head>/<body> tree that
- * browsers silently repair. Fragments get the full skeleton.
- */
 function assembleDocument({ html, css, javascript, nonce }: AssembleInput): string {
   const head: string[] = [
     `<meta http-equiv="Content-Security-Policy" content="${PREVIEW_CSP}">`,
@@ -258,19 +194,10 @@ export default function PreviewPanel({
     [hasContent, html, css, javascript, refreshKey],
   );
 
-  // Comparing sources (rather than tracking a loading flag) keeps the state
-  // correct no matter when the load event lands. React re-attaches the handler
-  // whenever the source changes, so a load is always attributed to the render
-  // that produced it.
   const handleLoad = useCallback(() => {
     setLoadedSource(documentSource);
   }, [documentSource]);
 
-  /*
-   * A failed CDN script and the TypeError it causes arrive as two separate
-   * messages. Keeping the last few (in arrival order) preserves that causal
-   * chain instead of letting the symptom overwrite the cause.
-   */
   const errors =
     runtimeErrors && runtimeErrors.source === documentSource
       ? runtimeErrors.messages
@@ -282,13 +209,6 @@ export default function PreviewPanel({
       ? "ready"
       : "rendering";
 
-  /*
-   * The framed document is cross-origin, so its console is unreadable from
-   * here; it reports over postMessage instead. Only messages that provably
-   * come from our own iframe are accepted, and their text is clamped — a
-   * generated script can post messages of its own, so this channel is
-   * advisory, not trusted.
-   */
   useEffect(() => {
     const handleMessage = (event: MessageEvent) => {
       if (event.source !== iframeRef.current?.contentWindow) return;
@@ -300,8 +220,6 @@ export default function PreviewPanel({
       if (typeof message !== "string") return;
       const text = sanitizeMessage(message) || "Script error in the preview.";
       setRuntimeErrors((prev) => {
-        // Errors belong to the render that produced them: a stale list
-        // disappears as soon as new code is applied.
         const base =
           prev && prev.source === documentSource ? prev.messages : [];
         if (base.includes(text)) return prev;
@@ -312,11 +230,6 @@ export default function PreviewPanel({
     return () => window.removeEventListener("message", handleMessage);
   }, [documentSource]);
 
-  /*
-   * Measure the well: a framed viewport is scaled to fit but keeps its true
-   * device size, while desktop reports the real box it is rendering at, so the
-   * number in the head never overstates the layout.
-   */
   useEffect(() => {
     const well = wellRef.current;
     if (!well) return;
@@ -349,111 +262,113 @@ export default function PreviewPanel({
   }, [framed, size.w, size.h, hasContent]);
 
   return (
-    <>
-      <div className="studio-panel-head">
-        <span className="studio-panel-head__label">Preview</span>
+    <div className="flex flex-col h-full w-full bg-[#000000] text-[#e1e1e1] overflow-hidden font-sans antialiased">
+      {/* Studio Preview Top Bar */}
+      <div className="flex items-center justify-between px-3 py-2 border-b border-[#1a1a1a] bg-[#050505] text-xs">
         <div className="flex items-center gap-2">
-          <span className="studio-hint studio-preview-dims" aria-live="polite">
+          <span className="font-medium text-[#cccccc]">Preview</span>
+          <span className="text-[10px] font-mono text-[#777777] bg-[#111111] px-2 py-0.5 rounded border border-[#222222]" aria-live="polite">
             {status === "rendering"
               ? "Rendering…"
               : dims
                 ? `${size.label} · ${dims.w} × ${dims.h}`
                 : ""}
           </span>
+        </div>
+
+        <div className="flex items-center gap-2">
+          {/* Viewport Segmented Control */}
           <div
-            className="studio-segmented"
+            className="flex items-center bg-[#111111] border border-[#222222] rounded-md p-0.5 space-x-0.5"
             role="group"
             aria-label="Preview viewport"
           >
             {VIEWPORT_ORDER.map((key) => {
               const Icon = VIEWPORT_ICONS[key];
+              const isSelected = viewport === key;
               return (
                 <button
                   key={key}
                   type="button"
-                  aria-pressed={viewport === key}
+                  aria-pressed={isSelected}
                   aria-label={`${VIEWPORTS[key].label} viewport`}
                   title={`${VIEWPORTS[key].label} viewport`}
                   onClick={() => setViewport(key)}
+                  className={`p-1 rounded transition-colors ${
+                    isSelected
+                      ? "bg-[#222222] text-[#ffffff]"
+                      : "text-[#777777] hover:text-[#cccccc]"
+                  }`}
                 >
-                  <Icon aria-hidden="true" />
+                  <Icon className="w-3.5 h-3.5" aria-hidden="true" />
                 </button>
               );
             })}
           </div>
+
+          {/* Refresh Button */}
           <button
             type="button"
-            className="studio-btn studio-btn--ghost studio-btn--icon"
+            className="p-1.5 rounded-md hover:bg-[#181818] text-[#777777] hover:text-[#cccccc] transition-colors disabled:opacity-40 disabled:cursor-not-allowed"
             onClick={onRefresh}
             disabled={!hasContent}
             aria-label="Re-render preview"
             title="Re-render preview"
           >
-            <RotateCw aria-hidden="true" />
+            <RotateCw className="w-3.5 h-3.5" aria-hidden="true" />
           </button>
         </div>
       </div>
 
-      <div className="studio-well" ref={wellRef}>
+      {/* Main Preview Container Well */}
+      <div className="relative flex-1 bg-[#0a0a0a] overflow-hidden flex items-center justify-center p-4" ref={wellRef}>
         {hasContent && (
           <iframe
             ref={iframeRef}
-            className={
-              framed ? "studio-device studio-device--framed" : "studio-device"
-            }
+            className={`border border-[#222222] bg-[#000000] shadow-2xl transition-all duration-200 ${
+              framed ? "rounded-xl overflow-hidden origin-center absolute" : "w-full h-full rounded-none"
+            }`}
             style={{
               width: framed ? size.w : "100%",
               height: framed ? size.h : "100%",
               transform: framed ? `scale(${scale})` : undefined,
             }}
-            /*
-             * `allow-scripts` alone. The document is created by the browser
-             * from srcdoc in an opaque origin, so it needs no same-origin
-             * privilege to exist — and with none it cannot reach the app, its
-             * storage, or its own sandbox attribute. No other capability is
-             * granted: no top navigation, popups, forms, downloads, or
-             * pointer-lock.
-             */
             sandbox="allow-scripts"
             srcDoc={documentSource}
             onLoad={handleLoad}
             title="Website preview"
-            /*
-             * One element per document. Assigning `srcdoc` on a frame that is
-             * still loading its initial document is racy: the browser cancels
-             * the replacement navigation often enough to leave the frame with
-             * no document at all, which shows up as a blank preview. Replacing
-             * the element gives the new document a single, uncontested
-             * navigation. Measured before/after: ~50% of fresh loads rendered
-             * nothing; 12/12 render after.
-             */
             key={documentSource}
           />
         )}
         {!hasContent && (
-          <div className="studio-well__empty">
-            No preview yet. Describe a website and press Generate to see it
-            here.
+          <div className="flex flex-col items-center justify-center text-center px-4 space-y-2">
+            <div className="w-9 h-9 rounded-full bg-[#141414] border border-[#222222] flex items-center justify-center text-[#777777]">
+              <Sparkles className="w-4 h-4 text-[#ffffff]" />
+            </div>
+            <p className="text-xs text-[#cccccc]">No preview generated yet.</p>
+            <p className="text-[11px] text-[#666666] max-w-[240px] leading-relaxed">
+              Describe your website in chat to build and render it here.
+            </p>
           </div>
         )}
       </div>
 
+      {/* Runtime Errors Toast Banner */}
       {errors && errors.length > 0 && (
-        <div className="studio-preview-error" role="status">
-          <AlertTriangle aria-hidden="true" />
-          <div className="studio-preview-error__list">
-            <span className="studio-preview-error__label">
-              Preview reported{" "}
-              {errors.length === 1 ? "an error" : `${errors.length} errors`}:
+        <div className="m-3 p-3 rounded-lg bg-[#1a0808] border border-[#3a1515] flex items-start gap-2.5 text-[#ff6b6b] text-xs shadow-lg" role="status">
+          <AlertTriangle className="w-4 h-4 shrink-0 mt-0.5" />
+          <div className="flex-1 space-y-1">
+            <span className="font-medium block">
+              Preview reported {errors.length === 1 ? "an error" : `${errors.length} errors`}:
             </span>
-            <ul>
+            <ul className="list-disc list-inside space-y-0.5 font-mono text-[11px] opacity-90">
               {errors.map((message) => (
-                <li key={message}>{message}</li>
+                <li key={message} className="truncate">{message}</li>
               ))}
             </ul>
           </div>
         </div>
       )}
-    </>
+    </div>
   );
 }

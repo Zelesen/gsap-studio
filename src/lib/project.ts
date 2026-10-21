@@ -57,10 +57,87 @@ export const APPROVED_IMPORTS = new Set([
   "@gsap/react",
 ]);
 
+/*
+ * dependencies is the manifest field models are most likely to forget or
+ * mangle. An absent dependencies map defaults to the approved set — every
+ * key in it is already compiler-approved, so this is strictly safe. Models
+ * also commonly emit an array instead of an object (`["react", "gsap"]` or
+ * `[{name: "react", version: "19.0.0"}, ...]`); those are converted when
+ * they can be mapped to known packages. Anything else (null, string,
+ * number, an empty or unmappable array) is rejected: we cannot guess what
+ * the model meant. Non-string values inside a valid container are caught by
+ * the per-entry check below.
+ */
+function normalizeDependencies(value: unknown): Record<string, unknown> | null {
+  if (value === undefined) return { ...APPROVED_DEPENDENCIES };
+  if (value === null) return null;
+  if (Array.isArray(value)) return dependenciesFromArray(value);
+  if (typeof value !== "object") return null;
+  return value as Record<string, unknown>;
+}
+
+/*
+ * Convert an array-style dependencies list into a name → version map.
+ * Accepts bare strings (versions resolved from APPROVED_DEPENDENCIES) and
+ * objects carrying a name plus a version (keys: name/package/dependency ×
+ * version). Returns null when nothing usable could be mapped.
+ */
+function dependenciesFromArray(value: unknown[]): Record<string, string> | null {
+  const deps: Record<string, string> = {};
+  for (const entry of value) {
+    if (typeof entry === "string") {
+      const version = APPROVED_DEPENDENCIES[entry as keyof typeof APPROVED_DEPENDENCIES];
+      if (typeof version === "string") {
+        deps[entry] = version;
+      }
+    } else if (entry && typeof entry === "object" && !Array.isArray(entry)) {
+      const e = entry as Record<string, unknown>;
+      const name =
+        typeof e.name === "string"
+          ? e.name
+          : typeof e.package === "string"
+            ? e.package
+            : typeof e.dependency === "string"
+              ? e.dependency
+              : null;
+      const version = e.version;
+      if (name && typeof version === "string") {
+        deps[name] = version;
+      }
+    }
+  }
+  return Object.keys(deps).length > 0 ? deps : null;
+}
+
+function dependenciesRejection(value: unknown): string {
+  if (value === null) return "null";
+  if (Array.isArray(value)) return "array";
+  if (typeof value === "string") return JSON.stringify(value);
+  return typeof value;
+}
+
 /** Check whether an import specifier is approved for use in generated projects. */
 export function isApprovedImport(specifier: string): boolean {
   if (APPROVED_IMPORTS.has(specifier)) return true;
   return [...APPROVED_IMPORTS].some((p) => p.endsWith("/") && specifier.startsWith(p));
+}
+
+/*
+ * The framework label is a constant as far as this pipeline is concerned —
+ * only React + TypeScript compiles here — but models write constants
+ * loosely: "React", "reactjs", "React TypeScript", stray whitespace, and
+ * sometimes the key is missing altogether. A generation must not fail over
+ * cosmetics, so every react-flavoured spelling (and an absent value)
+ * canonicalizes to "react-ts". A label naming a framework we cannot compile
+ * (vue, svelte, …) is still rejected: the compiler could not build it
+ * either, and failing here gives the caller the precise reason.
+ */
+function normalizeFramework(value: unknown): "react-ts" | null {
+  if (value === undefined || value === null) return "react-ts";
+  if (typeof value !== "string") return null;
+  const canonical = value.trim().toLowerCase().replace(/[^a-z0-9]/g, "");
+  if (canonical === "") return "react-ts";
+  return canonical.includes("react") ? "react-ts" : null;
 }
 
 /** Validate a project manifest. Returns error message or null. */
@@ -83,21 +160,33 @@ export function validateManifest(
   if (!m.entry.endsWith(".tsx") && !m.entry.endsWith(".ts")) {
     return { ok: false, error: "manifest.entry must be a .tsx or .ts file" };
   }
-  if (
-    typeof m.dependencies !== "object" ||
-    Array.isArray(m.dependencies) ||
-    m.dependencies === null
-  ) {
-    return { ok: false, error: "manifest.dependencies must be an object" };
+  const dependencies = normalizeDependencies(m.dependencies);
+  if (!dependencies) {
+    return {
+      ok: false,
+      error: `manifest.dependencies must be an object (received ${dependenciesRejection(m.dependencies)})`,
+    };
   }
-  if (m.framework !== "react-ts") {
-    return { ok: false, error: "manifest.framework must be 'react-ts'" };
+  const framework = normalizeFramework(m.framework);
+  if (!framework) {
+    // Echo what came back (safely) — "must be react-ts" alone gives no clue
+    // whether the model omitted the key or invented a different framework.
+    const received =
+      typeof m.framework === "string"
+        ? JSON.stringify(m.framework)
+        : typeof m.framework;
+    return {
+      ok: false,
+      error: `manifest.framework must be 'react-ts' (received ${received})`,
+    };
   }
-  // All dependency keys must be approved
-  for (const [key, value] of Object.entries(m.dependencies)) {
+  // All dependency values must be strings, and all keys must be approved
+  const cleanDependencies: Record<string, string> = {};
+  for (const [key, value] of Object.entries(dependencies)) {
     if (typeof value !== "string") {
       return { ok: false, error: `dependency ${key} version must be a string` };
     }
+    cleanDependencies[key] = value;
     // Check exact or prefix match against approved imports
     const approved = [...APPROVED_IMPORTS].some(
       (p) => p === key || (p.endsWith("/") && key.startsWith(p)),
@@ -112,8 +201,10 @@ export function validateManifest(
       name: m.name as string,
       version: m.version as string,
       entry: m.entry as string,
-      dependencies: m.dependencies as Record<string, string>,
-      framework: "react-ts",
+      // Normalized: an absent key defaults to the approved set; all keys are
+      // dependency-key approved by the loop above.
+      dependencies: cleanDependencies,
+      framework,
     },
   };
 }

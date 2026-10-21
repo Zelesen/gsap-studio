@@ -31,6 +31,24 @@
       "skillPath": "skills/gpt-tasteskill/SKILL.md",
       "computedHash": "f1c03a122783ba87e987264ee7a079516a2edc582324d7f35dfb5b34ac1bef07"
     },
+    "gsap-core": {
+      "source": "greensock/gsap-skills",
+      "sourceType": "github",
+      "skillPath": "skills/gsap-core/SKILL.md",
+      "computedHash": "b891c9ed42d9319685250231085ebe21538f2c844613b277b9dd2b3ff529a542"
+    },
+    "gsap-react": {
+      "source": "greensock/gsap-skills",
+      "sourceType": "github",
+      "skillPath": "skills/gsap-react/SKILL.md",
+      "computedHash": "255206fb6a4a079ad73b4a12e7c63197dc451a8549c7ac4e852b50ff74ef3bd6"
+    },
+    "gsap-scrolltrigger": {
+      "source": "greensock/gsap-skills",
+      "sourceType": "github",
+      "skillPath": "skills/gsap-scrolltrigger/SKILL.md",
+      "computedHash": "358dd3381c74fc4be8db5a94e0cd008bf0fa7c1ccd45999671b0d61b9d9ffd9b"
+    },
     "high-end-visual-design": {
       "source": "Leonxlnx/taste-skill",
       "sourceType": "github",
@@ -61,6 +79,12 @@
       "skillPath": "skills/brutalist-skill/SKILL.md",
       "computedHash": "f5f5fbe2b2a143f0205fad49ce169132921dc19d7cf2d5fa7e31a6295a116c3a"
     },
+    "intopia-web-accessibility": {
+      "source": "Intopia/intopia-web-accessibility-skill",
+      "sourceType": "github",
+      "skillPath": "SKILL.md",
+      "computedHash": "65df758f50c5626f8fcf64a38484b0366a477451a490faaa0ce56796b6f4d11b"
+    },
     "minimalist-ui": {
       "source": "Leonxlnx/taste-skill",
       "sourceType": "github",
@@ -78,6 +102,18 @@
       "sourceType": "github",
       "skillPath": "skills/stitch-skill/SKILL.md",
       "computedHash": "bc6a5d5406a4f35ae143939f8e66757c1475dc16c3fe38e750d37bd01e2a3421"
+    },
+    "vercel-composition-patterns": {
+      "source": "vercel-labs/agent-skills",
+      "sourceType": "github",
+      "skillPath": "skills/composition-patterns/SKILL.md",
+      "computedHash": "10eb4ec94577b79ae98c63ce3e7f35f8a6a06436a4011bff083b397de6960eeb"
+    },
+    "vercel-react-best-practices": {
+      "source": "vercel-labs/agent-skills",
+      "sourceType": "github",
+      "skillPath": "skills/react-best-practices/SKILL.md",
+      "computedHash": "6b526d013e28073246a36f99b529bc43745d30832ecfa8217b359c34f260ca6b"
     }
   }
 }

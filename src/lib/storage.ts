@@ -61,10 +61,21 @@ export interface StoredProject {
    * Optional and additive — projects saved before M3.1 (and legacy
    * HTML/CSS/JavaScript projects) simply do not have it and keep loading
    * exactly as before.
+   *
+   * From M3.2 on this is the *draft* copy — what the editor holds. The copy
+   * the preview was actually built from lives in `appliedSource`.
    */
   source?: SourceProjectFile[];
   /** Manifest describing the generated project. Absent in pre-M3.1 data. */
   manifest?: ProjectManifest;
+  /**
+   * Milestone 3.2: the source tree that was last successfully compiled into
+   * the preview — the dirty baseline for the source editor. Optional and
+   * additive: M3.1 projects saved only one copy (`source`), which had been
+   * compiled at generation time, so on load/save it is used for both. A blob
+   * with no `source` at all (legacy HTML/CSS/JavaScript projects) has neither.
+   */
+  appliedSource?: SourceProjectFile[];
 }
 
 const FILE_ROUTES: ReadonlyArray<{ name: string; key: keyof ProjectFiles }> = [
@@ -189,6 +200,15 @@ function normalizeProject(value: unknown): StoredProject | null {
   const source = normalizeSourceList(record.source);
   const manifest = normalizeManifest(record.manifest);
 
+  /*
+   * M3.2: the applied source is what the preview was built from. Blobs saved
+   * before M3.2 have only one copy — their `source` — which was compiled at
+   * generation time, so it is exactly what the preview renders. Missing or
+   * malformed values degrade to that same fallback, never to a crash.
+   */
+  const appliedSource =
+    normalizeSourceList(record.appliedSource) ?? source;
+
   return {
     id:
       typeof record.id === "string" && record.id.length > 0
@@ -202,6 +222,7 @@ function normalizeProject(value: unknown): StoredProject | null {
     ...(applied ? { applied } : {}),
     ...(source ? { source } : {}),
     ...(manifest ? { manifest } : {}),
+    ...(appliedSource ? { appliedSource } : {}),
     conversation: normalizeConversation(record.conversation),
   };
 }
@@ -242,12 +263,22 @@ export function saveProject(project: StoredProject): void {
   try {
     const source = normalizeSourceList(project.source);
     const manifest = normalizeManifest(project.manifest);
+    /*
+     * Same migration rule as load: without an applied copy (pre-M3.2 save,
+     * or a caller that only ever had one tree) the draft source *is* the
+     * version the preview was compiled from.
+     */
+    const appliedSource = normalizeSourceList(project.appliedSource) ?? source;
+    // The spread must not leak a stale copy: clear it first (JSON.stringify
+    // drops undefined values), then write back only the normalized form.
     const toSave: StoredProject = {
       ...project,
+      appliedSource: undefined,
       files: normalizeFileList(project.files),
       ...(project.applied ? { applied: normalizeFileList(project.applied) } : {}),
       ...(source ? { source } : {}),
       ...(manifest ? { manifest } : {}),
+      ...(appliedSource ? { appliedSource } : {}),
       conversation: normalizeConversation(project.conversation),
       updatedAt: Date.now(),
     };

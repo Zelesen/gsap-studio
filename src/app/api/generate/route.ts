@@ -6,12 +6,14 @@
  * Credentials are never exposed to the browser.
  */
 
-import { generateReactProject, REACT_SYSTEM_PROMPT, type ProjectResult } from "@/lib/ai";
+import { generateReactProject, type AIProvider, type Message, type ProjectResult } from "@/lib/ai";
+import { buildGenerationMessages } from "@/lib/prompt-assembly";
 import { compileProject, type CompileInput } from "@/lib/compiler";
 import { NextRequest, NextResponse } from "next/server";
 
 interface GenerateRequest {
   model?: string;
+  provider?: "openrouter" | "openai" | "google";
   messages: Array<{ role: string; content: string }>;
   currentHtml?: string;
   currentCss?: string;
@@ -50,7 +52,7 @@ interface GenerateResponse {
  * the preview iframe.
  */
 export async function POST(req: NextRequest): Promise<NextResponse> {
-  const modelFromEnv = process.env.OPENROUTER_MODEL;
+  const modelFromEnv = process.env.OPENROUTER_MODEL?.trim();
 
   let body: GenerateRequest;
   try {
@@ -69,31 +71,48 @@ export async function POST(req: NextRequest): Promise<NextResponse> {
     );
   }
 
-  const model = body.model || modelFromEnv || "openrouter/auto";
+  const provider = (body.provider || process.env.AI_PROVIDER || undefined) as
+    | AIProvider
+    | undefined;
 
-  // Build the message list: system prompt first, then conversation, with
-  // current code injected as context on follow-ups.
-  const messages: Array<{ role: string; content: string }> = [
-    { role: "system", content: REACT_SYSTEM_PROMPT },
-  ];
-
-  // If we have existing code, inject it as context so the model modifies
-  // rather than replaces on follow-ups.
-  if (
-    body.currentHtml ||
-    body.currentCss ||
-    body.currentJs
-  ) {
-    messages.push({
-      role: "system",
-      content: `CURRENT PROJECT STATE (compiled output):\n--- HTML ---\n${body.currentHtml || "(empty)"}\n--- CSS ---\n${body.currentCss || "(empty)"}\n--- JAVASCRIPT ---\n${body.currentJs || "(empty)"}\n--- END ---\nModify this code to fulfill the user's request. Preserve what is working and only change what is needed.`,
-    });
+  let model: string;
+  if (body.model) {
+    model = body.model;
+  } else if (provider === "google") {
+    model = process.env.GOOGLE_MODEL?.trim() || "gemini-3.6-flash";
+  } else if (provider === "openai") {
+    model = "gpt-4o-mini";
+  } else {
+    model = modelFromEnv || "openrouter/free";
   }
 
-  messages.push(...body.messages);
+  // Extract the user's latest request text for skill selection.
+  const userRequest = body.messages
+    .slice()
+    .reverse()
+    .find((m) => m.role === "user")
+    ?.content ?? "";
+
+  // Build messages: trusted system prompt + supplemental skill guidance +
+  // optional design brief + current project state + conversation. Skill
+  // guidance is lower priority and cannot override the trusted system prompt.
+  const { messages } = await buildGenerationMessages({
+    userRequest,
+    messages: body.messages as Message[],
+    currentHtml: body.currentHtml,
+    currentCss: body.currentCss,
+    currentJs: body.currentJs,
+    designBrief: null, // design-brief pipeline is out of scope for this phase.
+    wantsScrollAnimation: /scroll|parallax|pin|scrub/.test(
+      userRequest.toLowerCase()
+    ),
+    usesReactAndGsap: true,
+  });
 
   try {
-    const project = await generateReactProject(messages as never, model);
+    const project = await generateReactProject(messages as never, model, {
+      provider,
+    });
 
     // Compile the generated project using the existing compiler pipeline.
     const filesRecord: Record<string, string> = {};

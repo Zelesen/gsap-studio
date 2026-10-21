@@ -1568,73 +1568,114 @@ sup {
 
 /* ── code ── */
 
-.studio-tabs {
+/* ──────── EDITOR TABS (VS Code style) ──────── */
+
+.studio-editor-area__tabs {
   flex: none;
+}
+
+.studio-tabs {
   display: flex;
-  gap: 20px;
-  padding: 0 16px;
+  gap: 0;
+  padding: 0;
   border-bottom: 1px solid var(--studio-line);
+  background: var(--studio-surface);
+  align-items: center;
 }
 
 .studio-tab {
   position: relative;
-  padding: 11px 0;
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+  padding: 6px 10px;
   border: 0;
-  background: none;
-  color: var(--studio-faint);
-  font-size: 13px;
+  background: transparent;
+  color: var(--blaze-muted);
+  font-size: 12px;
+  font-family: var(--font-sans), system-ui, sans-serif;
+  font-weight: 400;
   cursor: pointer;
-  transition: color 150ms ease;
+  white-space: nowrap;
+  border-bottom: 2px solid transparent;
+  margin-bottom: -1px;
 }
 
 .studio-tab:hover {
   color: var(--blaze-text);
+  background: var(--studio-raised);
 }
 
-.studio-tab[aria-selected="true"] {
+.studio-tab--active {
   color: var(--blaze-text);
+  background: var(--studio-ground);
+  border-bottom-color: var(--studio-ground);
 }
 
-.studio-tab[aria-selected="true"]::after {
-  content: "";
-  position: absolute;
-  left: 0;
-  right: 0;
-  bottom: -1px;
-  height: 2px;
-  background: var(--blaze-text);
+.studio-tab--active .studio-tab__label {
+  font-weight: 500;
+}
+
+.studio-tab--dirty .studio-tab__dot {
+  display: block;
 }
 
 .studio-tab__dot {
-  display: inline-block;
-  width: 5px;
-  height: 5px;
-  margin-left: 6px;
+  display: none;
+  width: 6px;
+  height: 6px;
   border-radius: 50%;
-  background: var(--blaze-text);
-  vertical-align: middle;
+  background: var(--studio-line-strong);
+  flex: none;
+}
+
+.studio-tab__icon {
+  flex: none;
+  color: var(--studio-line-strong);
+}
+
+.studio-tab--active .studio-tab__icon {
+  color: var(--blaze-text);
+}
+
+.studio-tab__label {
+  overflow: hidden;
+  text-overflow: ellipsis;
+  min-width: 0;
+  flex: 1 1 auto;
+}
+
+.studio-tab__close {
+  display: none;
+  flex: none;
+  align-items: center;
+  justify-content: center;
+  width: 20px;
+  height: 20px;
+  padding: 0;
+  margin-left: 6px;
+  border: 0;
+  background: transparent;
+  color: var(--blaze-muted);
+  cursor: pointer;
+  border-radius: 3px;
+}
+
+.studio-tab__close:hover {
+  background: #3e3e42;
+  color: var(--blaze-text);
+}
+
+.studio-tab:hover .studio-tab__close,
+.studio-tab--active .studio-tab__close {
+  display: inline-flex;
 }
 
 .studio-editor {
   position: relative;
   flex: 1 1 auto;
   min-height: 0;
-}
-
-.studio-editor textarea {
-  display: block;
-  width: 100%;
-  height: 100%;
-  padding: 16px;
-  border: 0;
-  background: transparent;
-  color: var(--blaze-text);
-  font-family: var(--font-mono), ui-monospace, monospace;
-  font-size: 13px;
-  line-height: 20px;
-  resize: none;
-  outline: none;
-  tab-size: 2;
+  background: var(--studio-ground);
 }
 
 .studio-editor__overlay {
@@ -1661,8 +1702,15 @@ sup {
   align-items: center;
   justify-content: space-between;
   gap: 12px;
-  padding: 10px 16px;
+  padding: 8px 12px;
   border-top: 1px solid var(--studio-line);
+  background: var(--studio-surface);
+}
+
+/* Preview and Code panes stay mounted so state is preserved across mode
+ * switches; only the active pane is laid out. */
+.studio-pane--hidden {
+  display: none;
 }
 
 /* ── the phone: nav folds, one region at a time ── */
@@ -1691,6 +1739,277 @@ sup {
 @media (max-width: 560px) {
   .studio-preview-dims {
     display: none;
+  }
+}
+
+/* ──────── CODE WORKSPACE (VS Code style) ──────── */
+
+.studio-code-workspace {
+  display: flex;
+  flex: 1 1 auto;
+  min-width: 0;
+  min-height: 0;
+  overflow: hidden;
+  background: var(--studio-ground);
+}
+
+.studio-code-editor-area {
+  flex: 1 1 0;
+  min-width: 0;
+  min-height: 0;
+  display: flex;
+  flex-direction: column;
+  overflow: hidden;
+  background: var(--studio-ground);
+}
+
+/* ──────── Explorer sidebar ──────── */
+
+.studio-explorer {
+  flex: none;
+  width: 260px;
+  min-width: 0;
+  max-width: 40vw;
+  display: flex;
+  flex-direction: column;
+  border-right: 1px solid var(--studio-line);
+  background: var(--studio-surface);
+  overflow: hidden;
+}
+
+.studio-explorer__head {
+  flex: none;
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 8px;
+  height: 40px;
+  padding: 0 14px;
+  border-bottom: 1px solid var(--studio-line);
+  background: var(--studio-surface);
+}
+
+.studio-explorer__title-row {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  min-width: 0;
+}
+
+.studio-explorer__title-icon {
+  flex: none;
+  color: var(--studio-line-strong);
+}
+
+.studio-explorer__title {
+  font-size: 12px;
+  font-weight: 600;
+  color: var(--blaze-text);
+  letter-spacing: -0.01em;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  min-width: 0;
+}
+
+.studio-explorer__actions {
+  display: flex;
+  gap: 6px;
+}
+
+.studio-explorer__action {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  width: 26px;
+  height: 26px;
+  padding: 0;
+  margin: 0;
+  border: 0;
+  background: transparent;
+  color: var(--blaze-muted);
+  cursor: pointer;
+  border-radius: 3px;
+}
+
+.studio-explorer__action:hover {
+  background: var(--studio-raised);
+  color: var(--blaze-text);
+}
+
+.studio-explorer__tree {
+  flex: 1 1 auto;
+  min-height: 0;
+  overflow-y: auto;
+  font-size: 12px;
+  font-family: var(--font-sans), system-ui, sans-serif;
+}
+
+.studio-explorer__folder,
+.studio-explorer__file {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  height: 22px;
+  padding: 0 4px 0 4px;
+  cursor: pointer;
+  border-radius: 3px;
+  color: var(--blaze-muted);
+  font-size: 12px;
+}
+
+.studio-explorer__folder:hover,
+.studio-explorer__file:hover {
+  background: var(--studio-raised);
+  color: var(--blaze-text);
+}
+
+.studio-explorer__file--selected {
+  background: var(--studio-raised);
+  color: var(--blaze-text);
+  font-weight: 500;
+  border-left: 2px solid var(--studio-line-strong);
+  margin-left: -2px;
+  padding-left: 2px;
+}
+
+.studio-explorer__indent {
+  flex: none;
+  position: relative;
+}
+
+.studio-explorer__guide {
+  position: absolute;
+  left: 0;
+  width: 1px;
+  background: var(--studio-line);
+}
+
+.studio-explorer__chevron {
+  flex: none;
+  color: var(--studio-line-strong);
+}
+
+.studio-explorer__folder-icon,
+.studio-explorer__file-icon {
+  flex: none;
+  color: var(--studio-line-strong);
+}
+
+.studio-explorer__name {
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  min-width: 0;
+  flex: 1 1 auto;
+}
+
+.studio-explorer__empty {
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  justify-content: center;
+  flex: none;
+  padding: 40px 16px;
+  color: var(--studio-line-strong);
+  text-align: center;
+}
+
+.studio-explorer__empty-icon {
+  flex: none;
+  color: var(--studio-line-strong);
+  margin-bottom: 10px;
+}
+
+.studio-explorer__empty-title {
+  margin: 0 0 4px 0;
+  font-size: 13px;
+  font-weight: 600;
+  color: var(--blaze-text);
+}
+
+.studio-explorer__empty-sub {
+  margin: 0;
+  font-size: 12px;
+  color: var(--blaze-muted);
+}
+
+@media (max-width: 900px) {
+  .studio-explorer {
+    width: 210px;
+    max-width: 55vw;
+  }
+}
+
+/* ──────── syntax editor ──────── */
+
+.studio-syntax-editor {
+  position: relative;
+  width: 100%;
+  height: 100%;
+}
+
+.studio-syntax-editor__highlight {
+  position: absolute;
+  inset: 0;
+  margin: 0;
+  padding: 16px;
+  overflow: auto;
+  pointer-events: none;
+  white-space: pre-wrap;
+  word-wrap: break-word;
+  background: transparent;
+  color: var(--blaze-text);
+  font-family: var(--font-mono), ui-monospace, monospace;
+  font-size: 13px;
+  line-height: 20px;
+  tab-size: 2;
+  box-sizing: border-box;
+}
+
+.studio-syntax-editor__textarea {
+  position: absolute;
+  inset: 0;
+  margin: 0;
+  padding: 16px;
+  width: 100%;
+  height: 100%;
+  border: 0;
+  background: transparent;
+  color: var(--blaze-text);
+  font-family: var(--font-mono), ui-monospace, monospace;
+  font-size: 13px;
+  line-height: 20px;
+  tab-size: 2;
+  resize: none;
+  outline: none;
+  box-sizing: border-box;
+  overflow: auto;
+  caret-color: var(--blaze-text);
+  white-space: pre-wrap;
+}
+
+.studio-syntax-editor__textarea::placeholder {
+  color: var(--studio-line-strong);
+}
+
+.syntax--comment { color: #6a9955; }
+.syntax--string { color: #ce9178; }
+.syntax--keyword { color: #569cd6; }
+.syntax--function { color: #dcdcaa; }
+.syntax--type { color: #4ec9b0; }
+.syntax--tag { color: #569cd6; }
+.syntax--tag-name { color: #4ec9b0; }
+.syntax--attr { color: #9cdcfe; }
+.syntax--value { color: #ce9178; }
+.syntax--number { color: #b5cea8; }
+.syntax--text { color: var(--blaze-text); }
+.syntax--key { color: #9cdcfe; }
+
+@media (prefers-reduced-motion: reduce) {
+  .studio-syntax-editor__highlight,
+  .studio-syntax-editor__textarea {
+    transition: none;
   }
 }
 

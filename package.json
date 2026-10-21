@@ -10,8 +10,11 @@
     "lint": "eslint",
     "test:generate": "tsx test/generate.test.ts",
     "test:storage": "tsx test/storage-m31.test.ts",
+    "test:m32": "tsx test/m32-source.test.ts",
     "test:generate-e2e": "tsx test/generate-e2e.mjs",
-    "test:generate-browser": "node test/generate-browser.mjs"
+    "test:generate-browser": "node test/generate-browser.mjs",
+    "test:health": "node test/health-check.mjs",
+    "test:m2": "node test/m2-regression.mjs"
   },
   "dependencies": {
     "@babel/parser": "^7.29.9",
@@ -20,6 +23,7 @@
     "@types/archiver": "^6.0.0",
     "archiver": "^7.0.0",
     "esbuild": "^0.28.2",
+    "googleapis": "^186.0.0",
     "gsap": "^3.12.5",
     "lucide-react": "^1.59.0",
     "next": "16.4.2",

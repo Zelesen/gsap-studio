@@ -3,7 +3,7 @@
 import { useCallback, useEffect, useState } from "react";
 
 import ChatPanel from "@/components/studio/ChatPanel";
-import CodePanel from "@/components/studio/CodePanel";
+import CodeWorkspace from "@/components/studio/CodeWorkspace";
 import PreviewPanel from "@/components/studio/PreviewPanel";
 import StudioLayout from "@/components/studio/StudioLayout";
 import {
@@ -103,6 +103,15 @@ export default function StudioPage() {
   const [drafts, setDrafts] = useState<ProjectFiles>(INITIAL_FILES);
   const [applied, setApplied] = useState<ProjectFiles>(INITIAL_FILES);
   const [projectFiles, setProjectFiles] = useState<ProjectFile[]>([]);
+  /*
+   * M3.2: draft source (`projectFiles`) and the source the preview was last
+   * compiled from are tracked separately, mirroring drafts/applied for the
+   * legacy triple. Apply advances this only when the compile succeeds, so a
+   * broken draft can never become the dirty baseline.
+   */
+  const [appliedSourceFiles, setAppliedSourceFiles] = useState<ProjectFile[]>(
+    [],
+  );
   const [projectManifest, setProjectManifest] = useState<ProjectManifest | null>(
     null,
   );
@@ -111,6 +120,8 @@ export default function StudioPage() {
   );
 
   const [isLoading, setIsLoading] = useState(false);
+  /* M3.2: a source Apply runs a compile; tracked apart from generation. */
+  const [isCompiling, setIsCompiling] = useState(false);
   const [error, setError] = useState<string | null>(null);
   const [refreshKey, setRefreshKey] = useState(0);
   const [panels, setPanels] = useState({
@@ -118,6 +129,8 @@ export default function StudioPage() {
     preview: { collapsed: false },
     code: { collapsed: false },
   });
+  const [mode, setMode] = useState<"preview" | "code">("preview");
+  const [selectedPath, setSelectedPath] = useState<string | null>(null);
 
   /*
    * Hydration is deferred rather than read during the first render: the server
@@ -141,6 +154,9 @@ export default function StudioPage() {
         // M3.1: restore the generated multi-file source when present. Legacy
         // projects have no source and simply keep their old behaviour.
         setProjectFiles(stored.source ?? []);
+        // M3.2: the applied source defaults to the draft for pre-M3.2 blobs
+        // (storage already applies that migration on load).
+        setAppliedSourceFiles(stored.appliedSource ?? stored.source ?? []);
         setProjectManifest(stored.manifest ?? null);
         setConversation(stored.conversation);
       } else {
@@ -156,7 +172,7 @@ export default function StudioPage() {
    * Persist the project on every change. Both copies of the code are written,
    * so a refresh restores the drafts *and* the applied version — the preview
    * does not silently advance to unsaved edits. The generated multi-file
-   * source is stored alongside when present.
+   * source is stored alongside when present, draft and applied copies alike.
    */
   useEffect(() => {
     if (!hydrated) return;
@@ -165,10 +181,22 @@ export default function StudioPage() {
       files: toFileList(drafts),
       applied: toFileList(applied),
       ...(projectFiles.length > 0 ? { source: projectFiles } : {}),
+      ...(appliedSourceFiles.length > 0
+        ? { appliedSource: appliedSourceFiles }
+        : {}),
       ...(projectManifest ? { manifest: projectManifest } : {}),
       conversation,
     });
-  }, [hydrated, project, drafts, applied, projectFiles, projectManifest, conversation]);
+  }, [
+    hydrated,
+    project,
+    drafts,
+    applied,
+    projectFiles,
+    appliedSourceFiles,
+    projectManifest,
+    conversation,
+  ]);
 
   const handleGenerate = useCallback(
     async (prompt: string) => {
@@ -187,6 +215,9 @@ export default function StudioPage() {
           method: "POST",
           headers: { "Content-Type": "application/json" },
           body: JSON.stringify({
+            // Provider is server-resolved: explicit env `AI_PROVIDER` wins for
+            // operators; the Studio stays provider-agnostic and never sends keys.
+            provider: process.env.NEXT_PUBLIC_AI_PROVIDER || undefined,
             messages: [...conversation, userMsg],
             currentHtml: drafts.html,
             currentCss: drafts.css,
@@ -217,6 +248,9 @@ export default function StudioPage() {
           });
         }
         setProjectFiles(data.files ?? []);
+        // The generation compiled these files and the preview renders them,
+        // so the applied source is the generated tree itself.
+        setAppliedSourceFiles(data.files ?? []);
         setProjectManifest(data.manifest ?? null);
         setConversation((prev) => [
           ...prev,
@@ -249,15 +283,74 @@ export default function StudioPage() {
     setDrafts(next);
   }, []);
 
+  /* Source drafts only — the preview stays on the last compiled tree. */
+  const handleSourceChange = useCallback((next: ProjectFile[]) => {
+    setProjectFiles(next);
+  }, []);
+
   /*
-   * Apply copies the drafts into the preview. The preview's own document
-   * changes with them, which is what re-renders it — there is no separate
-   * refresh counter to bump.
+   * Apply for a legacy project is a pure client-side copy: the drafts are the
+   * preview artifact, so there is nothing to build.
+   *
+   * Apply for a React project compiles the draft source through /api/compile
+   * first. Only a successful build advances the preview (`applied`) and the
+   * applied source baseline — a compile error leaves both on the last good
+   * version and surfaces the diagnostics to the chat. The compiled output is
+   * mirrored into `drafts` too, because follow-up generations use it as their
+   * current-state context.
    */
-  const handleApply = useCallback(() => {
+  const handleApply = useCallback(async () => {
     setError(null);
-    setApplied(drafts);
-  }, [drafts]);
+
+    if (projectFiles.length === 0) {
+      setApplied(drafts);
+      return;
+    }
+
+    if (!projectManifest) {
+      setError(
+        "This project has no manifest, so its source cannot be compiled.",
+      );
+      return;
+    }
+
+    const filesRecord: Record<string, string> = {};
+    for (const file of projectFiles) {
+      filesRecord[file.path] = file.content;
+    }
+
+    setIsCompiling(true);
+    try {
+      const response = await fetch("/api/compile", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({
+          files: filesRecord,
+          entry: projectManifest.entry,
+        }),
+      });
+      const data = await response.json();
+
+      if (!response.ok || !data.ok) {
+        throw new Error(data.error || "Compilation failed.");
+      }
+
+      const compiled: ProjectFiles = {
+        html: data.html ?? "",
+        css: data.css ?? "",
+        javascript: data.js ?? "",
+      };
+      setDrafts(compiled);
+      setApplied(compiled);
+      setAppliedSourceFiles(projectFiles);
+    } catch (err) {
+      setError(
+        err instanceof Error ? err.message : "Compilation failed.",
+      );
+    } finally {
+      setIsCompiling(false);
+    }
+  }, [drafts, projectFiles, projectManifest]);
 
   /* Re-render the same applied code from scratch. */
   const handleRerender = useCallback(() => {
@@ -276,6 +369,7 @@ export default function StudioPage() {
     setDrafts(INITIAL_FILES);
     setApplied(INITIAL_FILES);
     setProjectFiles([]);
+    setAppliedSourceFiles([]);
     setProjectManifest(null);
     setConversation([]);
     setError(null);
@@ -293,6 +387,8 @@ export default function StudioPage() {
   return (
     <StudioLayout
       title={PROJECT_TITLE}
+      mode={mode}
+      onModeChange={setMode}
       onNewProject={handleNewProject}
       onTogglePanel={handleTogglePanel}
       panels={{
@@ -321,15 +417,22 @@ export default function StudioPage() {
         },
         code: {
           element: (
-            <CodePanel
-              files={drafts}
+            <CodeWorkspace
+              projectName={projectManifest?.name ?? PROJECT_TITLE}
+              source={projectFiles}
+              appliedSource={appliedSourceFiles}
+              onSourceChange={handleSourceChange}
+              legacyFiles={drafts}
               applied={applied}
-              onChange={handleFileChange}
+              onLegacyChange={handleFileChange}
               onApply={handleApply}
-              isApplying={isLoading}
+              isApplying={isLoading || isCompiling}
+              busyLabel={isCompiling ? "Compiling source…" : undefined}
+              selectedPath={selectedPath}
+              onFileSelect={setSelectedPath}
             />
           ),
-          collapsed: panels.code.collapsed,
+          collapsed: false,
         },
       }}
     />
