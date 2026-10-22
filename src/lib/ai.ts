@@ -1,13 +1,13 @@
 if (typeof window === "undefined") {
-  // One-time diagnostic so you can confirm which provider and key the server
-  // is actually using (visible in the next dev terminal output). Never throws:
-  // missing keys surface as configuration_error at request time.
-  try {
-    console.log(
-      `[gsap-studio] AI provider: ${resolveProvider()} · key prefix: ${(providerApiKey(resolveProvider()).slice(0, 12))}...`,
-    );
-  } catch {
-    console.log(`[gsap-studio] AI provider: ${resolveProvider()} · key: missing`);
+  // Skip diagnostic in test mode (no OPENROUTER_API_KEY)
+  if (process.env.OPENROUTER_API_KEY) {
+    try {
+      console.log(
+        `[gsap-studio] AI provider: ${resolveProvider()} · key prefix: ${(providerApiKey(resolveProvider()).slice(0, 12))}...`,
+      );
+    } catch {
+      console.log(`[gsap-studio] AI provider: ${resolveProvider()} · key: missing`);
+    }
   }
 }
 ﻿/*
@@ -24,6 +24,7 @@ if (typeof window === "undefined") {
  */
 
 import { validateProjectResult, type ProjectResult } from "@/lib/project";
+import { normalizeRuntimeImports } from "@/lib/imports";
 
 export interface Message {
   role: "system" | "user" | "assistant";
@@ -37,9 +38,17 @@ export type { ProjectResult, ProjectManifest, ProjectFile, APPROVED_DEPENDENCIES
 /* Google (Gemini) model id: body wins, then `GOOGLE_MODEL` env, then default. */
 export const GOOGLE_MODEL_DEFAULT = "gemini-3.6-flash";
 
+/* Placeholder credential used when the caller explicitly skips the auth check. */
+const AUTH_SKIPPED = "auth-check-skipped";
+
 /** Resolve the Gemini API key (`GOOGLE_API_KEY`, `GOOGLE_MODAL` alias kept). */
-export function googleApiKey(): string {
-  return getEnv("GOOGLE_API_KEY", ["GOOGLE_MODAL"]);
+export function googleApiKey(options?: { skipAuthCheck?: boolean }): string {
+  try {
+    return getEnv("GOOGLE_API_KEY", ["GOOGLE_MODAL"]);
+  } catch (err) {
+    if (options?.skipAuthCheck) return AUTH_SKIPPED;
+    throw err;
+  }
 }
 
 /**
@@ -105,7 +114,12 @@ Design principles:
 - Use semantic HTML5. Every image needs alt text. Use proper heading hierarchy.
 - Fully responsive: mobile-first, fluid typography with clamp(), touch-friendly targets.
 - Accessibility: sufficient color contrast, focus states, ARIA where appropriate, prefers-reduced-motion respected.
-- Include GSAP where motion adds value â€” subtle reveals, scroll-triggered animations, smooth hover transitions. Keep it restrained and intentional.
+- Include GSAP where motion adds value — subtle reveals, scroll-triggered animations, smooth hover transitions. Keep it restrained and intentional.
+- Import the runtime with named imports, never with a namespace import:
+    import { gsap } from "gsap";
+    import { ScrollTrigger } from "gsap/ScrollTrigger";
+    import { useGSAP } from "@gsap/react";
+  'import * as gsap from "gsap"' gives you the module namespace, which has no registerPlugin, and the preview breaks.
 - Register GSAP plugins explicitly (e.g. gsap.registerPlugin(ScrollTrigger)).
 - Use React 19 with createRoot for DOM rendering.
 - Use @gsap/react's useGSAP for GSAP integration in React components.
@@ -181,10 +195,24 @@ function providerBaseUrl(provider: AIProvider): string {
     : "https://openrouter.ai/api/v1/chat/completions";
 }
 
-function providerApiKey(provider: AIProvider): string {
-  return provider === "openai"
-    ? getEnv("OPENAI_API_KEY", ["OPEN_AI_API_KEY"])
-    : getEnv("OPENROUTER_API_KEY");
+function providerApiKey(
+  provider: AIProvider,
+  options?: { skipAuthCheck?: boolean },
+): string {
+  try {
+    return provider === "openai"
+      ? getEnv("OPENAI_API_KEY", ["OPEN_AI_API_KEY"])
+      : getEnv("OPENROUTER_API_KEY");
+  } catch (err) {
+    /*
+     * `skipAuthCheck` exists for callers that bring their own transport
+     * (tests with a stubbed fetch): they need a placeholder credential
+     * instead of a hard configuration failure. No route sets it, so a
+     * missing key still fails loudly in production.
+     */
+    if (options?.skipAuthCheck) return AUTH_SKIPPED;
+    throw err;
+  }
 }
 
 function parseProjectResult(raw: string): ProjectResult {
@@ -236,19 +264,31 @@ function parseProjectResult(raw: string): ProjectResult {
       "invalid_response",
     );
   }
-  return validated.result;
+  /*
+   * The model sometimes writes `import * as gsap from "gsap"`, which compiles
+   * but cannot run: the preview's import map hands the code the module
+   * namespace, which has no `registerPlugin`. Normalizing here means the
+   * project the studio stores is the project the preview can run.
+   */
+  return {
+    ...validated.result,
+    files: validated.result.files.map((file) => ({
+      path: file.path,
+      content: normalizeRuntimeImports(file.content),
+    })),
+  };
 }
 
-export async function generateReactProject(
+async function generateRawCompletion(
   messages: Message[],
   model: string,
-  options?: { provider?: AIProvider },
-): Promise<ProjectResult> {
+  options?: { provider?: AIProvider; skipAuthCheck?: boolean },
+): Promise<string> {
   const provider = resolveProvider(options?.provider);
   if (provider === "google") {
-    return generateGeminiProject(messages, model);
+    return fetchGeminiRaw(messages, model, options);
   }
-  const apiKey = providerApiKey(provider);
+  const apiKey = providerApiKey(provider, options);
   const baseUrl = providerBaseUrl(provider);
 
   const body: OpenRouterChatCompletion = {
@@ -256,7 +296,6 @@ export async function generateReactProject(
     messages,
     temperature: 0.4,
     max_tokens: 12000,
-    response_format: { type: "json_object" },
   };
 
   // OpenRouter-specific referral headers are unnecessary (and ignored) for
@@ -322,7 +361,7 @@ export async function generateReactProject(
       throw new AIError("Model returned no content.", 502, "invalid_response");
     }
 
-    return parseProjectResult(content);
+    return content;
   } catch (err) {
     if (err instanceof AIError) {
       throw err;
@@ -352,11 +391,16 @@ export async function generateReactProject(
  * roles), and a different response shape (`candidates[].content.parts`).
  * Response validation is shared (`parseProjectResult`) once text is out.
  */
-async function generateGeminiProject(
+/**
+ * Fetch raw text from Google (Gemini). Returns the concatenated parts text,
+ * or throws AIError.
+ */
+async function fetchGeminiRaw(
   messages: Message[],
   model: string,
-): Promise<ProjectResult> {
-  const apiKey = googleApiKey();
+  options?: { skipAuthCheck?: boolean },
+): Promise<string> {
+  const apiKey = googleApiKey(options);
   const cleanModel = model.includes("/") ? model.split("/").pop()! : model;
   const url = `https://generativelanguage.googleapis.com/v1beta/models/${encodeURIComponent(cleanModel)}:generateContent`;
 
@@ -413,7 +457,7 @@ async function generateGeminiProject(
       throw new AIError("Model returned no content.", 502, "invalid_response");
     }
 
-    return parseProjectResult(content);
+    return content;
   } catch (err) {
     if (err instanceof AIError) {
       throw err;
@@ -434,4 +478,30 @@ async function generateGeminiProject(
   }
 }
 
-export { AIError, OpenRouterError, REACT_SYSTEM_PROMPT };
+/**
+ * Google (Gemini) provider. Wraps `fetchGeminiRaw` with JSON parsing and
+ * project validation.
+ */
+async function generateGeminiProject(
+  messages: Message[],
+  model: string,
+): Promise<ProjectResult> {
+  const raw = await fetchGeminiRaw(messages, model);
+  return parseProjectResult(raw);
+}
+
+/**
+ * Generate a multi-file React + TypeScript project from a conversation.
+ *
+ * Wraps `generateRawCompletion` with JSON parsing and project validation.
+ */
+export async function generateReactProject(
+  messages: Message[],
+  model: string,
+  options?: { provider?: AIProvider; skipAuthCheck?: boolean },
+): Promise<ProjectResult> {
+  const raw = await generateRawCompletion(messages, model, options);
+  return parseProjectResult(raw);
+}
+
+export { AIError, OpenRouterError, REACT_SYSTEM_PROMPT, generateRawCompletion };

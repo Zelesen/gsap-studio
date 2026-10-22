@@ -127,11 +127,11 @@ export async function POST(req: NextRequest): Promise<NextResponse> {
 
     const compiled = await compileProject(compileInput);
 
-    if (compiled.diagnostics.length > 0) {
+    if (compiled.errors.length > 0) {
       return NextResponse.json(
         {
           ok: false,
-          error: `Compilation failed: ${compiled.diagnostics.join("\n")}`,
+          error: `Compilation failed: ${compiled.errors.join("\n")}`,
           type: "compilation_error",
           status: 400,
         },

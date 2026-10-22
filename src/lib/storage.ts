@@ -28,6 +28,8 @@ import type {
   ProjectFile as SourceProjectFile,
   ProjectManifest,
 } from "@/lib/project";
+import { validateDesignBrief, type DesignBrief } from "@/lib/design-brief";
+import { validateTaskPlan, type TaskPlan } from "@/lib/task-plan";
 
 export type { ProjectManifest } from "@/lib/project";
 
@@ -76,6 +78,12 @@ export interface StoredProject {
    * with no `source` at all (legacy HTML/CSS/JavaScript projects) has neither.
    */
   appliedSource?: SourceProjectFile[];
+  /** Milestone 3.5: the design brief for the current project. */
+  designBrief?: DesignBrief;
+  /** Milestone 3.5: the task plan for the current project. */
+  taskPlan?: TaskPlan;
+  /** Milestone 3.5: the approval status of tasks. */
+  approvedTasks: string[];
 }
 
 const FILE_ROUTES: ReadonlyArray<{ name: string; key: keyof ProjectFiles }> = [
@@ -186,6 +194,38 @@ function normalizeConversation(input: unknown): ConversationMessage[] {
   return out;
 }
 
+/**
+ * Normalize the approved-task list. Only strings survive; anything else
+ * (a number, an object, a hole in the array) is dropped. An absent or
+ * malformed list means "nothing is approved", never a crash.
+ */
+function normalizeApprovedTasks(input: unknown): string[] {
+  if (!Array.isArray(input)) return [];
+  return input.filter((taskId): taskId is string => typeof taskId === "string");
+}
+
+/**
+ * Normalize the M3.5 design brief. A brief that no longer satisfies the
+ * contract is dropped rather than half-restored: the project keeps loading
+ * with the rest of its state intact.
+ */
+function normalizeDesignBrief(input: unknown): DesignBrief | undefined {
+  if (!input || typeof input !== "object" || Array.isArray(input)) return undefined;
+  const check = validateDesignBrief(input);
+  return check.ok ? check.value : undefined;
+}
+
+/**
+ * Normalize the M3.5 task plan with the very contract the runner uses, so a
+ * stored plan is always structurally executable. A malformed plan (unknown
+ * task ids, dependency cycles, a broken brief) degrades to "no plan".
+ */
+function normalizeTaskPlan(input: unknown): TaskPlan | undefined {
+  if (!input || typeof input !== "object" || Array.isArray(input)) return undefined;
+  const check = validateTaskPlan(input);
+  return check.ok ? check.value : undefined;
+}
+
 function normalizeProject(value: unknown): StoredProject | null {
   if (!value || typeof value !== "object" || Array.isArray(value)) return null;
   const record = value as Record<string, unknown>;
@@ -199,6 +239,15 @@ function normalizeProject(value: unknown): StoredProject | null {
   // M3.1 additions — both optional, both absent in pre-M3.1 projects.
   const source = normalizeSourceList(record.source);
   const manifest = normalizeManifest(record.manifest);
+
+  /*
+   * M3.5 additions — the design brief and the task plan. Both are optional
+   * and additive: a project saved before M3.5 simply has neither. A
+   * malformed value degrades to "absent" instead of taking the project
+   * down with it.
+   */
+  const designBrief = normalizeDesignBrief(record.designBrief);
+  const taskPlan = normalizeTaskPlan(record.taskPlan);
 
   /*
    * M3.2: the applied source is what the preview was built from. Blobs saved
@@ -224,6 +273,9 @@ function normalizeProject(value: unknown): StoredProject | null {
     ...(manifest ? { manifest } : {}),
     ...(appliedSource ? { appliedSource } : {}),
     conversation: normalizeConversation(record.conversation),
+    approvedTasks: normalizeApprovedTasks(record.approvedTasks),
+    ...(designBrief ? { designBrief } : {}),
+    ...(taskPlan ? { taskPlan } : {}),
   };
 }
 
@@ -234,6 +286,7 @@ export function createEmptyProject(): StoredProject {
     files: toFileList(EMPTY_FILES),
     applied: toFileList(EMPTY_FILES),
     conversation: [],
+    approvedTasks: [],
   };
 }
 
@@ -269,17 +322,26 @@ export function saveProject(project: StoredProject): void {
      * version the preview was compiled from.
      */
     const appliedSource = normalizeSourceList(project.appliedSource) ?? source;
+    // The M3.5 plan and brief are normalized with the same contract the
+    // loader uses, so a save can never write a value the loader rejects.
+    const designBrief = normalizeDesignBrief(project.designBrief);
+    const taskPlan = normalizeTaskPlan(project.taskPlan);
     // The spread must not leak a stale copy: clear it first (JSON.stringify
     // drops undefined values), then write back only the normalized form.
     const toSave: StoredProject = {
       ...project,
       appliedSource: undefined,
+      designBrief: undefined,
+      taskPlan: undefined,
       files: normalizeFileList(project.files),
       ...(project.applied ? { applied: normalizeFileList(project.applied) } : {}),
       ...(source ? { source } : {}),
       ...(manifest ? { manifest } : {}),
       ...(appliedSource ? { appliedSource } : {}),
+      ...(designBrief ? { designBrief } : {}),
+      ...(taskPlan ? { taskPlan } : {}),
       conversation: normalizeConversation(project.conversation),
+      approvedTasks: normalizeApprovedTasks(project.approvedTasks),
       updatedAt: Date.now(),
     };
     window.localStorage.setItem(STORAGE_KEY, JSON.stringify(toSave));

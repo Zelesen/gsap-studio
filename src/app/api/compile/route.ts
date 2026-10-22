@@ -58,10 +58,13 @@ export async function POST(req: NextRequest): Promise<NextResponse> {
 
     try {
       const result = await compileProject({ files: body.files, entry: body.entry });
-      if (result.diagnostics.length > 0) {
+      // Only errors fail the compile. A warning (an unquoted data URL in a
+      // stylesheet, for instance) still produced output and must not stop
+      // the preview from rendering.
+      if (result.errors.length > 0) {
         // A failed build is a client-side problem (bad import, syntax error),
         // not a server fault.
-        return NextResponse.json({ ok: false, error: result.diagnostics.join("\n") }, { status: 400 });
+        return NextResponse.json({ ok: false, error: result.errors.join("\n") }, { status: 400 });
       }
       return NextResponse.json({ ok: true, ...result });
     } catch (e) {

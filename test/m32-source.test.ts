@@ -178,6 +178,7 @@ saveProject({
   source: DRAFT_SOURCE,
   appliedSource: SOURCE,
   manifest: MANIFEST,
+  approvedTasks: [],
 });
 project = loadProject();
 assert(
@@ -203,6 +204,7 @@ saveProject({
   conversation: [],
   source: SOURCE,
   manifest: MANIFEST,
+  approvedTasks: [],
 });
 blob = rawBlob();
 assert(
@@ -236,6 +238,7 @@ saveProject({
   updatedAt: 0,
   files: FILES_V1,
   conversation: [],
+  approvedTasks: [],
 });
 blob = rawBlob();
 assert(!("source" in (blob ?? {})), "save omits source when absent");
@@ -294,6 +297,7 @@ saveProject({
   source: DRAFT_SOURCE,
   appliedSource: SOURCE,
   manifest: MANIFEST,
+  approvedTasks: [],
 });
 project = loadProject();
 assert(

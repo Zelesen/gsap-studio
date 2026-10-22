@@ -124,18 +124,37 @@ interface AssembleInput {
   nonce: number;
 }
 
-function assembleDocument({ html, css, javascript, nonce }: AssembleInput): string {
+/**
+ * Build the document the preview frame loads.
+ *
+ * Exported for the test suite: the assembly rules (what is injected, what is
+ * left alone) are the contract between the studio and the preview.
+ */
+export function assembleDocument({
+  html,
+  css,
+  javascript,
+  nonce,
+}: AssembleInput): string {
+  /*
+   * A compiled React project is one self-contained document: the import map,
+   * the inlined CSS and the module script all live in the HTML. Injecting the
+   * CSS and the JS again would add the ESM bundle as a classic script, which
+   * the browser refuses ("Cannot use import statement outside a module").
+   */
+  const selfContained = /<script[^>]+type=["']module["']/i.test(html);
+
   const head: string[] = [
     `<meta http-equiv="Content-Security-Policy" content="${PREVIEW_CSP}">`,
     `<script>${PREVIEW_BRIDGE}</script>`,
     `<!-- studio-render:${nonce} -->`,
   ];
-  if (css.trim().length > 0) {
+  if (!selfContained && css.trim().length > 0) {
     head.push(`<style>\n${escapeBlockEnd(css, "style")}\n</style>`);
   }
 
   const foot: string[] = [];
-  if (javascript.trim().length > 0) {
+  if (!selfContained && javascript.trim().length > 0) {
     foot.push(`<script>\n${escapeBlockEnd(javascript, "script")}\n</script>`);
   }
 

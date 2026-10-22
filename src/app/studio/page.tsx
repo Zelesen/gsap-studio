@@ -1,11 +1,12 @@
 "use client";
 
-import { useCallback, useEffect, useState } from "react";
+import { useCallback, useEffect, useRef, useState } from "react";
 
 import ChatPanel from "@/components/studio/ChatPanel";
 import CodeWorkspace from "@/components/studio/CodeWorkspace";
 import PreviewPanel from "@/components/studio/PreviewPanel";
 import StudioLayout from "@/components/studio/StudioLayout";
+import TaskPlanPanel from "@/components/studio/TaskPlanPanel";
 import {
   clearProject,
   createEmptyProject,
@@ -16,6 +17,12 @@ import {
 } from "@/lib/storage";
 import type { ProjectFiles, StoredProject } from "@/lib/storage";
 import type { ProjectFile, ProjectManifest } from "@/lib/project";
+import type { DesignBrief } from "@/lib/design-brief";
+import {
+  approvePlan,
+  nextReadyTask,
+  type TaskPlan,
+} from "@/lib/task-plan";
 
 /*
  * Studio page — AI website builder at /studio.
@@ -96,6 +103,9 @@ const SERVER_PROJECT: StoredProject = {
   files: toFileList(INITIAL_FILES),
   applied: toFileList(INITIAL_FILES),
   conversation: [],
+  designBrief: undefined,
+  taskPlan: undefined,
+  approvedTasks: [],
 };
 
 export default function StudioPage() {
@@ -118,6 +128,20 @@ export default function StudioPage() {
   const [conversation, setConversation] = useState<StoredProject["conversation"]>(
     [],
   );
+
+  /*
+   * M3.5: the planning state. The brief and the plan are part of the
+   * project, so they are persisted with it (see the save effect below) and
+   * restored on load. `approvedTasks` lists the task ids the user cleared
+   * for execution — the runner refuses anything outside that list.
+   */
+  const [designBrief, setDesignBrief] = useState<DesignBrief | null>(null);
+  const [taskPlan, setTaskPlan] = useState<TaskPlan | null>(null);
+  const [approvedTasks, setApprovedTasks] = useState<string[]>([]);
+  const [isPlanning, setIsPlanning] = useState(false);
+  const [isRunning, setIsRunning] = useState(false);
+  const [runningTaskId, setRunningTaskId] = useState<string | null>(null);
+  const [planError, setPlanError] = useState<string | null>(null);
 
   const [isLoading, setIsLoading] = useState(false);
   /* M3.2: a source Apply runs a compile; tracked apart from generation. */
@@ -142,6 +166,15 @@ export default function StudioPage() {
    */
   const [hydrated, setHydrated] = useState(false);
 
+  /*
+   * Guards against two failure modes the runner cannot see:
+   *  - `runRef` counts runs: a response from a superseded run is dropped.
+   *  - `revisionRef` counts source edits: a result computed from an older
+   *    tree is dropped instead of overwriting newer edits.
+   */
+  const runRef = useRef(0);
+  const revisionRef = useRef(0);
+
   useEffect(() => {
     queueMicrotask(() => {
       const stored = loadProject();
@@ -159,6 +192,10 @@ export default function StudioPage() {
         setAppliedSourceFiles(stored.appliedSource ?? stored.source ?? []);
         setProjectManifest(stored.manifest ?? null);
         setConversation(stored.conversation);
+        // M3.5: restore the planning state.
+        setDesignBrief(stored.designBrief ?? null);
+        setTaskPlan(stored.taskPlan ?? null);
+        setApprovedTasks(stored.approvedTasks ?? []);
       } else {
         setProject(createEmptyProject());
         setDrafts(INITIAL_FILES);
@@ -173,6 +210,8 @@ export default function StudioPage() {
    * so a refresh restores the drafts *and* the applied version — the preview
    * does not silently advance to unsaved edits. The generated multi-file
    * source is stored alongside when present, draft and applied copies alike.
+   * The M3.5 planning state (brief, plan, approved tasks) is part of the
+   * project too, so plan progress survives a reload.
    */
   useEffect(() => {
     if (!hydrated) return;
@@ -185,6 +224,9 @@ export default function StudioPage() {
         ? { appliedSource: appliedSourceFiles }
         : {}),
       ...(projectManifest ? { manifest: projectManifest } : {}),
+      designBrief: designBrief ?? undefined,
+      taskPlan: taskPlan ?? undefined,
+      approvedTasks,
       conversation,
     });
   }, [
@@ -195,6 +237,9 @@ export default function StudioPage() {
     projectFiles,
     appliedSourceFiles,
     projectManifest,
+    designBrief,
+    taskPlan,
+    approvedTasks,
     conversation,
   ]);
 
@@ -252,6 +297,8 @@ export default function StudioPage() {
         // so the applied source is the generated tree itself.
         setAppliedSourceFiles(data.files ?? []);
         setProjectManifest(data.manifest ?? null);
+        // A new project invalidates any task result computed from the old one.
+        revisionRef.current += 1;
         setConversation((prev) => [
           ...prev,
           {
@@ -286,6 +333,8 @@ export default function StudioPage() {
   /* Source drafts only — the preview stays on the last compiled tree. */
   const handleSourceChange = useCallback((next: ProjectFile[]) => {
     setProjectFiles(next);
+    // A user edit invalidates any task result computed from the old tree.
+    revisionRef.current += 1;
   }, []);
 
   /*
@@ -335,13 +384,20 @@ export default function StudioPage() {
         throw new Error(data.error || "Compilation failed.");
       }
 
+      /*
+       * The compiled document is self-contained: it carries the import map,
+       * the inlined CSS and the module script. Handing the same CSS and JS to
+       * the preview on top of it would inject the ESM bundle a second time —
+       * as a classic script — and break the preview with "Cannot use import
+       * statement outside a module". The code panel keeps the split CSS/JS.
+       */
       const compiled: ProjectFiles = {
         html: data.html ?? "",
         css: data.css ?? "",
         javascript: data.js ?? "",
       };
       setDrafts(compiled);
-      setApplied(compiled);
+      setApplied({ html: compiled.html, css: "", javascript: "" });
       setAppliedSourceFiles(projectFiles);
     } catch (err) {
       setError(
@@ -358,6 +414,241 @@ export default function StudioPage() {
     setRefreshKey((key) => key + 1);
   }, []);
 
+  /*
+   * M3.5 — planning.
+   *
+   * The brief and the plan are produced server-side (the provider key never
+   * leaves the server). The plan comes back as a draft: the user reads it
+   * and approves it before anything runs.
+   */
+  const handleCreatePlan = useCallback(async () => {
+    setPlanError(null);
+
+    if (conversation.length === 0) {
+      setPlanError(
+        "Describe the website you want first — the plan is built from this conversation.",
+      );
+      return;
+    }
+
+    setIsPlanning(true);
+    try {
+      const briefResponse = await fetch("/api/design-brief", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ messages: conversation }),
+      });
+      const briefData = await briefResponse.json();
+      if (!briefResponse.ok || !briefData.ok) {
+        throw new Error(
+          briefData.error || "The design brief could not be created.",
+        );
+      }
+      const brief = briefData.brief as DesignBrief;
+
+      const planResponse = await fetch("/api/task-plan", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ brief, messages: conversation }),
+      });
+      const planData = await planResponse.json();
+      if (!planResponse.ok || !planData.ok) {
+        throw new Error(planData.error || "The task plan could not be created.");
+      }
+
+      const plan = planData.plan as TaskPlan;
+      setDesignBrief(brief);
+      setTaskPlan(plan);
+      // A fresh plan has nothing approved yet.
+      setApprovedTasks([]);
+      setConversation((prev) => [
+        ...prev,
+        {
+          role: "assistant",
+          content: `Plan ready — ${plan.tasks.length} task(s). Review it, then approve it to run the tasks.`,
+        },
+      ]);
+    } catch (err) {
+      setPlanError(
+        err instanceof Error ? err.message : "The plan could not be created.",
+      );
+    } finally {
+      setIsPlanning(false);
+    }
+  }, [conversation]);
+
+  /*
+   * Approving the plan is the gate for execution: only an approved plan
+   * runs, and only the tasks cleared here. The approval re-validates every
+   * plan invariant before the plan becomes executable.
+   */
+  const handleApprovePlan = useCallback(() => {
+    if (!taskPlan) return;
+    const approved = approvePlan(taskPlan);
+    if (!approved.ok) {
+      setPlanError(approved.error);
+      return;
+    }
+    setTaskPlan(approved.value);
+    setApprovedTasks(approved.value.tasks.map((task) => task.id));
+    setPlanError(null);
+    setConversation((prev) => [
+      ...prev,
+      {
+        role: "assistant",
+        content: `Plan approved — ${approved.value.tasks.length} task(s) cleared for execution.`,
+      },
+    ]);
+  }, [taskPlan]);
+
+  /*
+   * M3.5 — execution.
+   *
+   * One task at a time, and only when its dependencies are completed. The
+   * runner works server-side; the client keeps ownership of the project:
+   * on success the returned tree becomes both the draft and the applied
+   * source (the compile succeeded, so it is the last valid preview), and on
+   * failure neither the source nor the preview changes — only the task
+   * status and its error summary, so the task can be retried.
+   */
+  const executeTasks = useCallback(
+    async (
+      startPlan: TaskPlan,
+      startFiles: ProjectFile[],
+      taskId: string | undefined,
+      runAll: boolean,
+    ) => {
+      if (!projectManifest) {
+        setPlanError(
+          "This project has no manifest, so its source cannot be edited.",
+        );
+        return;
+      }
+
+      const runId = ++runRef.current;
+      const startRevision = revisionRef.current;
+      setIsRunning(true);
+      setPlanError(null);
+
+      let currentPlan = startPlan;
+      let currentFiles = startFiles;
+
+      try {
+        for (;;) {
+          let targetId = taskId;
+          if (runAll) {
+            const next = nextReadyTask(currentPlan);
+            if (!next) break;
+            targetId = next.id;
+          }
+          if (!targetId) break;
+          setRunningTaskId(targetId);
+
+          const response = await fetch("/api/task-run", {
+            method: "POST",
+            headers: { "Content-Type": "application/json" },
+            body: JSON.stringify({
+              plan: currentPlan,
+              approvedTasks,
+              manifest: projectManifest,
+              files: currentFiles,
+              taskId: targetId,
+            }),
+          });
+          const data = await response.json();
+
+          // A newer run superseded this one: drop the response entirely.
+          if (runId !== runRef.current) return;
+
+          // The source changed while the task ran, so its result is stale:
+          // applying it would overwrite newer edits.
+          if (startRevision !== revisionRef.current) {
+            setPlanError(
+              "The project changed while the task was running, so its result was discarded. Run the task again.",
+            );
+            return;
+          }
+
+          if (!response.ok || !data.ok) {
+            // The plan progress (the failed task and its error) is kept; the
+            // source and the preview are left exactly as they were.
+            if (data.plan) setTaskPlan(data.plan as TaskPlan);
+            setPlanError(data.error || "The task could not be completed.");
+            return;
+          }
+
+          currentPlan = data.plan as TaskPlan;
+          currentFiles = (data.files as ProjectFile[]) ?? currentFiles;
+          setTaskPlan(currentPlan);
+          setProjectFiles(currentFiles);
+          setAppliedSourceFiles(currentFiles);
+          if (data.compiled) {
+            /*
+             * The compiled document is self-contained (import map, inlined CSS,
+             * module script), so the preview gets it alone — injecting the ESM
+             * bundle again as a classic script would break it.
+             */
+            const compiled: ProjectFiles = {
+              html: data.compiled.html ?? "",
+              css: data.compiled.css ?? "",
+              javascript: data.compiled.javascript ?? "",
+            };
+            setDrafts(compiled);
+            setApplied({ html: compiled.html, css: "", javascript: "" });
+          }
+          setConversation((prev) => [
+            ...prev,
+            {
+              role: "assistant",
+              content: `Task "${data.task?.title ?? "Task"}" completed — ${
+                data.verification?.summary ?? "the task was applied and verified."
+              }`,
+            },
+          ]);
+
+          if (!runAll) break;
+        }
+      } catch (err) {
+        setPlanError(
+          err instanceof Error
+            ? err.message
+            : "The task could not be completed.",
+        );
+      } finally {
+        if (runId === runRef.current) {
+          setIsRunning(false);
+          setRunningTaskId(null);
+        }
+      }
+    },
+    [approvedTasks, projectManifest],
+  );
+
+  const handleRunNextTask = useCallback(() => {
+    if (!taskPlan) return;
+    const next = nextReadyTask(taskPlan);
+    if (!next) {
+      setPlanError(
+        "No task can run yet — the remaining tasks are waiting on unfinished dependencies.",
+      );
+      return;
+    }
+    void executeTasks(taskPlan, projectFiles, next.id, false);
+  }, [taskPlan, projectFiles, executeTasks]);
+
+  const handleRunAllTasks = useCallback(() => {
+    if (!taskPlan) return;
+    void executeTasks(taskPlan, projectFiles, undefined, true);
+  }, [taskPlan, projectFiles, executeTasks]);
+
+  const handleRetryTask = useCallback(
+    (taskId: string) => {
+      if (!taskPlan) return;
+      void executeTasks(taskPlan, projectFiles, taskId, false);
+    },
+    [taskPlan, projectFiles, executeTasks],
+  );
+
   const handleNewProject = useCallback(() => {
     if (
       !window.confirm(
@@ -372,7 +663,12 @@ export default function StudioPage() {
     setAppliedSourceFiles([]);
     setProjectManifest(null);
     setConversation([]);
+    setDesignBrief(null);
+    setTaskPlan(null);
+    setApprovedTasks([]);
+    setPlanError(null);
     setError(null);
+    revisionRef.current += 1;
     clearProject();
     setProject(createEmptyProject());
   }, []);
@@ -394,12 +690,31 @@ export default function StudioPage() {
       panels={{
         chat: {
           element: (
-            <ChatPanel
-              messages={conversation}
-              isLoading={isLoading}
-              error={error}
-              onSend={handleGenerate}
-            />
+            <div className="flex flex-col h-full min-h-0">
+              <div className="flex-1 min-h-0">
+                <ChatPanel
+                  messages={conversation}
+                  isLoading={isLoading}
+                  error={error}
+                  onSend={handleGenerate}
+                />
+              </div>
+              <TaskPlanPanel
+                brief={designBrief}
+                plan={taskPlan}
+                approvedTasks={approvedTasks}
+                isPlanning={isPlanning}
+                isRunning={isRunning}
+                runningTaskId={runningTaskId}
+                error={planError}
+                canRun={projectFiles.length > 0 && projectManifest !== null}
+                onCreatePlan={handleCreatePlan}
+                onApprove={handleApprovePlan}
+                onRunNext={handleRunNextTask}
+                onRunAll={handleRunAllTasks}
+                onRetry={handleRetryTask}
+              />
+            </div>
           ),
           collapsed: panels.chat.collapsed,
         },
